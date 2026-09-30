@@ -60,17 +60,11 @@ python --version
 
 আউটপুট দেখাবে: `Python 3.x.x`
 
----
-
-### ধাপ ৩ — pip আপগ্রেড করুন
-
-```bash
-pip install --upgrade pip
-```
+> ⚠️ **নোট:** Termux-এ কখনো `pip install --upgrade pip` চালাবেন না! এটি Termux-এর কাস্টম pip ভেঙে দেবে। pip আপডেট করতে সবসময় `pkg upgrade python` ব্যবহার করুন।
 
 ---
 
-### ধাপ ৪ — Git ইনস্টল করুন
+### ধাপ ৩ — Git ইনস্টল করুন
 
 ```bash
 pkg install -y git
