@@ -1686,6 +1686,32 @@ def admin_guide():
     return render_admin("Termux গাইড","guide", html)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Global Error Handler (Prevents blank Internal Server Error)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.errorhandler(500)
+@app.errorhandler(Exception)
+def handle_error(e):
+    import traceback
+    err_trace = traceback.format_exc()
+    print("[ERROR]", err_trace)
+    # Attempt DB self-healing
+    try:
+        init_db()
+    except Exception:
+        pass
+    return f"""
+    <!DOCTYPE html><html><head><meta charset='utf-8'><title>System Notice</title>
+    <style>body{{font-family:sans-serif;padding:24px;background:#f8fafc;color:#1e293b}}
+    .box{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;max-width:500px;margin:30px auto;box-shadow:0 4px 12px rgba(0,0,0,0.05)}}
+    .btn{{display:inline-block;padding:10px 16px;background:#007bff;color:#fff;border-radius:6px;text-decoration:none;margin-top:12px}}</style>
+    </head><body><div class='box'>
+    <h3>⚠️ সিস্টেমে সাময়িক সমস্যা হয়েছে</h3>
+    <p>ডাটাবেস স্বয়ংক্রিয়ভাবে রিকভার করা হয়েছে। অনুগ্রহ করে পেজটি রিফ্রেশ করুন।</p>
+    <a href='/' class='btn'>🔄 পেজ রিফ্রেশ করুন</a>
+    </div></body></html>
+    """, 500
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Startup
 # ─────────────────────────────────────────────────────────────────────────────
 def banner():
@@ -1697,7 +1723,9 @@ def banner():
     print("  Login  : admin / admin")
     print("=" * 60)
 
+# Always initialize on start
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     banner()
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
