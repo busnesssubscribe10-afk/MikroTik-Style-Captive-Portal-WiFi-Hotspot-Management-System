@@ -378,23 +378,23 @@ PACKAGES_TMPL = """<!DOCTYPE html><html lang="bn"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>{{ s.site_name }}</title><style>{{ css|safe }}
 body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;align-items:flex-start;
-  justify-content:center;padding:24px 16px;min-height:100vh}
+  justify-content:center;padding:20px 14px;min-height:100vh}
 .portal-wrap{width:100%;max-width:520px}
 .portal-head{background:{{ s.primary_color }};border-radius:16px 16px 0 0;
-  padding:26px 20px;color:#fff;text-align:center}
-.portal-head .icon{font-size:40px;margin-bottom:7px}
-.portal-head h2{font-size:1.3rem;font-weight:700}
-.portal-head p{font-size:.82rem;opacity:.9;margin-top:3px}
+  padding:24px 18px;color:#fff;text-align:center}
+.portal-head .icon{font-size:38px;margin-bottom:6px}
+.portal-head h2{font-size:1.25rem;font-weight:700}
+.portal-head p{font-size:.8rem;opacity:.9;margin-top:2px}
 .portal-body{background:#fff;border-radius:0 0 16px 16px;padding:22px 18px}
-.section-title{font-size:.9rem;font-weight:700;color:var(--muted);
-  text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px}
-.voucher-link{display:block;text-align:center;margin-top:16px;padding:12px;
-  background:#f8fafc;border:1.5px dashed var(--border);border-radius:8px;
-  font-size:.85rem;color:var(--muted);transition:.2s}
-.voucher-link:hover{border-color:var(--p);color:var(--p);background:#f0f7ff}
-.contact-link{display:flex;align-items:center;justify-content:center;gap:8px;
-  margin-top:10px;padding:10px;background:#fff3cd;border:1px solid #ffeeba;
-  border-radius:8px;font-size:.83rem;color:#856404;text-decoration:none}
+.pin-box{background:#f8fafc;border:2px solid #cbd5e0;border-radius:12px;padding:18px;margin-bottom:20px;text-align:center}
+.pin-input{letter-spacing:14px;font-size:2rem;text-align:center;font-weight:800;height:60px;border:2px solid var(--border);border-radius:10px;color:var(--dark);margin-bottom:12px}
+.pin-input:focus{border-color:var(--p)}
+.divider{display:flex;align-items:center;text-align:center;margin:20px 0;color:var(--muted);font-size:.8rem;font-weight:600}
+.divider::before,.divider::after{content:'';flex:1;border-bottom:1px solid var(--border)}
+.divider:not(:empty)::before{margin-right:.8em}
+.divider:not(:empty)::after{margin-left:.8em}
+.section-title{font-size:.85rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;text-align:center}
+.contact-link{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:14px;padding:11px;background:#fff3cd;border:1px solid #ffeeba;border-radius:8px;font-size:.83rem;color:#856404;text-decoration:none}
 </style></head><body>
 <div class="portal-wrap">
   <div class="portal-head">
@@ -406,18 +406,35 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;align-items
     {% with msgs=get_flashed_messages(with_categories=true) %}
       {% for cat,msg in msgs %}<div class="alert alert-{{cat}}">{{msg}}</div>{% endfor %}
     {% endwith %}
-    <div class="section-title">একটি প্যাকেজ বেছে নিন</div>
+
+    <!-- 1. Instant 4-Digit PIN Voucher Login -->
+    <div class="pin-box">
+      <div style="font-size:.92rem;font-weight:700;color:var(--dark);margin-bottom:8px">🎟️ আপনার ৪-ডিজিট ভাউচার পিন দিন</div>
+      <form method="POST" action="{{ url_for('login') }}">
+        <input name="pin" class="form-control pin-input"
+               placeholder="••••" maxlength="4" inputmode="numeric"
+               pattern="[0-9]{4}" required autofocus>
+        <button type="submit" class="btn btn-primary btn-block" style="padding:13px;font-size:1.05rem;background:{{ s.primary_color }}">
+          🚀 ইন্টারনেট চালু করুন (Connect)
+        </button>
+      </form>
+    </div>
+
+    <div class="divider">অথবা ভাউচার পিন কিনুন (বিকাশ / নগদ)</div>
+
+    <!-- 2. Package Plans -->
+    <div class="section-title">প্যাকেজ বেছে নিয়ে পিন সংগ্রহ করুন</div>
     <div class="pkg-cards">
       {% for pkg in packages %}
       <a href="{{ url_for('order_page', pkg_id=pkg.id) }}" style="text-decoration:none">
         <div class="pkg-card {% if loop.index==2 %}popular{% endif %}">
           {% if loop.index==2 %}<div class="pkg-badge">জনপ্রিয়</div>{% endif %}
-          <div style="font-size:1.05rem;font-weight:700;color:var(--dark)">{{ pkg.name }}</div>
+          <div style="font-size:1.02rem;font-weight:700;color:var(--dark)">{{ pkg.name }}</div>
           <div class="pkg-price">৳{{ "%.0f"|format(pkg.price) }}</div>
           <div class="pkg-dur">⏱ {{ pkg.duration_minutes }} মিনিট</div>
-          <div style="font-size:.8rem;color:var(--muted);margin-bottom:14px">{{ pkg.description }}</div>
-          <button class="btn btn-primary btn-block" style="background:{{ s.primary_color }}">
-            এই প্ল্যান নিন →
+          <div style="font-size:.78rem;color:var(--muted);margin-bottom:12px">{{ pkg.description }}</div>
+          <button class="btn btn-success btn-block" style="padding:9px">
+            কিনুন (বিকাশ/নগদ) →
           </button>
         </div>
       </a>
@@ -425,13 +442,14 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;align-items
       <div class="alert alert-warning">কোনো প্যাকেজ পাওয়া যায়নি।</div>
       {% endfor %}
     </div>
-    <a href="{{ url_for('voucher_page') }}" class="voucher-link">
-      🎟️ আমার কাছে ভাউচার কোড আছে — সরাসরি কানেক্ট করুন
-    </a>
+
+    <!-- 3. Contact Admin -->
     <a href="{{ url_for('contact_page') }}" class="contact-link">
       💬 অ্যাডমিনের সাথে যোগাযোগ করুন
     </a>
-    <p style="text-align:center;font-size:.75rem;color:var(--muted);margin-top:14px">{{ s.footer_text }}</p>
+    <div style="text-align:center;margin-top:14px">
+      <a href="{{ url_for('admin_login') }}" style="font-size:.78rem;color:#64748b">⚙️ অ্যাডমিন লগইন</a>
+    </div>
   </div>
 </div></body></html>"""
 

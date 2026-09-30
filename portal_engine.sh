@@ -60,23 +60,19 @@ echo -e "${YELLOW}[3/4] iptables ক্যাপটিভ পোর্টাল 
 
 # Clean existing rules
 iptables -t nat -F PREROUTING 2>/dev/null || true
-iptables -F FORWARD 2>/dev/null || true
+# Redirect Port 80 & 443 HTTP/HTTPS to Flask 8080
+iptables -t nat -I PREROUTING 1 -p tcp --dport 80 -j REDIRECT --to-port 8080
+iptables -t nat -I PREROUTING 1 -p tcp --dport 443 -j REDIRECT --to-port 8080
 
-# Redirect Port 80 HTTP to Flask 8080
-iptables -t nat -A PREROUTING -i "$HOTSPOT_IFACE" -p tcp --dport 80 -j REDIRECT --to-port 8080
-
-# Redirect Port 443 HTTPS to Flask 8080
-iptables -t nat -A PREROUTING -i "$HOTSPOT_IFACE" -p tcp --dport 443 -j REDIRECT --to-port 8080
-
-# Redirect DNS Port 53 UDP to Port 5353 (dnsmasq)
-iptables -t nat -A PREROUTING -i "$HOTSPOT_IFACE" -p udp --dport 53 -j REDIRECT --to-port 5353
-iptables -t nat -A PREROUTING -i "$HOTSPOT_IFACE" -p tcp --dport 53 -j REDIRECT --to-port 5353
+# Redirect DNS Port 53 UDP/TCP to Port 5353 (dnsmasq)
+iptables -t nat -I PREROUTING 1 -p udp --dport 53 -j REDIRECT --to-port 5353
+iptables -t nat -I PREROUTING 1 -p tcp --dport 53 -j REDIRECT --to-port 5353
 
 # Allow established connections & DNS locally
-iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+iptables -I FORWARD 1 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 
-# BLOCK direct internet access for unauthenticated users (Forces Captive Portal Sign-in!)
-iptables -A FORWARD -i "$HOTSPOT_IFACE" -j DROP
+# STRICT BLOCK: Force captive portal sign-in by dropping unauthenticated forward traffic
+iptables -I FORWARD 2 -j DROP
 
 echo -e "${GREEN}[✓] iptables কনফিগারেশন সম্পন্ন!${NC}"
 
