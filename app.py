@@ -98,11 +98,25 @@ def init_db():
         replied_at TEXT,
         is_read INTEGER DEFAULT 0)""")
 
+    # Auto-migration for existing tables with older schemas
+    def add_column_if_missing(table, col, col_type):
+        try:
+            cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
+            if col not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+        except Exception:
+            pass
+
+    add_column_if_missing("active_sessions", "package_id", "INTEGER")
+    add_column_if_missing("active_sessions", "expires_at", "TEXT")
+    add_column_if_missing("vouchers", "source", "TEXT DEFAULT 'manual'")
+    add_column_if_missing("vouchers", "order_id", "TEXT")
+
     # Default admin
     if not c.execute("SELECT id FROM admin_users WHERE username='admin'").fetchone():
         c.execute("INSERT INTO admin_users(username,password_hash) VALUES(?,?)",
                   ("admin", generate_password_hash("admin")))
-        print("[*] Default admin → username: admin | password: admin")
+        print("[*] Default admin -> username: admin | password: admin")
 
     # Default settings
     for k, v in {
@@ -1675,23 +1689,13 @@ def admin_guide():
 # Startup
 # ─────────────────────────────────────────────────────────────────────────────
 def banner():
-    print("""
-╔══════════════════════════════════════════════════════════╗
-║   MikroTik Captive Portal — Full Payment & Hotspot       ║
-╠══════════════════════════════════════════════════════════╣
-║  Portal   →  http://0.0.0.0:8080/                       ║
-║  Admin    →  http://0.0.0.0:8080/admin                  ║
-║  Login    →  admin / admin                              ║
-╠══════════════════════════════════════════════════════════╣
-║  NEW FEATURES:                                          ║
-║  ✓ Package Plans (customizable from admin)              ║
-║  ✓ bKash / Nagad / Rocket payment support               ║
-║  ✓ Auto-voucher generation after payment approval       ║
-║  ✓ Session expiry timer (countdown on status page)      ║
-║  ✓ User ↔ Admin messaging system                       ║
-║  ✓ Captive portal popup (requires iptables + root)      ║
-╚══════════════════════════════════════════════════════════╝
-""")
+    print("=" * 60)
+    print("  MikroTik Captive Portal - Full Payment & Hotspot System")
+    print("=" * 60)
+    print("  Portal : http://0.0.0.0:8080/")
+    print("  Admin  : http://0.0.0.0:8080/admin")
+    print("  Login  : admin / admin")
+    print("=" * 60)
 
 if __name__ == "__main__":
     init_db()
