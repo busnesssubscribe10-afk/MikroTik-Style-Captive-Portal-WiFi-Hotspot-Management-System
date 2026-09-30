@@ -3,11 +3,26 @@
 """
 =============================================================================
   MikroTik-Style Captive Portal — Full Payment & Hotspot Management System
-  Features: Package Plans · bKash/Nagad · Auto-Voucher · Timer · Messaging
+  Features:
+    • Automatic Captive Portal Detection (Android/iOS/Windows/Chrome)
+    • 4-Digit Voucher PIN Login with Strict Expiration Timer
+    • bKash / Nagad / Rocket Package Payment & Auto-Voucher Generator
+    • Built-in Background Session & Expiration Worker
+    • Built-in DNS Responder Thread for Captive Portal Spoofing
+    • Full-featured Admin Dashboard with Site Customization
 =============================================================================
 """
 
-import os, sqlite3, random, string, subprocess
+import os
+import sys
+import time
+import socket
+import select
+import threading
+import sqlite3
+import random
+import string
+import subprocess
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import (Flask, request, redirect, url_for, session,
@@ -15,29 +30,34 @@ from flask import (Flask, request, redirect, url_for, session,
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "hotspot_secret_2026_xK9mQ")
+app.secret_key = os.environ.get("SECRET_KEY", "mikrotik_hotspot_ultra_secret_2026_xP9")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH  = os.path.join(BASE_DIR, "hotspot.db")
 HOST, PORT = "0.0.0.0", 8080
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Database
+# Database Management & Auto-Migration
 # ─────────────────────────────────────────────────────────────────────────────
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    conn = get_db(); c = conn.cursor()
+    conn = get_db()
+    c = conn.cursor()
 
     c.execute("""CREATE TABLE IF NOT EXISTS admin_users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL)""")
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL
+    )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS site_settings(
-        key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS vouchers(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +66,9 @@ def init_db():
         source TEXT DEFAULT 'manual',
         order_id TEXT,
         created_at TEXT DEFAULT (datetime('now','localtime')),
-        used_at TEXT, used_by_ip TEXT)""")
+        used_at TEXT,
+        used_by_ip TEXT
+    )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS active_sessions(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,23 +77,27 @@ def init_db():
         package_id INTEGER,
         login_time TEXT DEFAULT (datetime('now','localtime')),
         expires_at TEXT,
-        user_agent TEXT)""")
+        user_agent TEXT
+    )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS packages(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL, price REAL NOT NULL,
+        name TEXT NOT NULL,
+        price REAL NOT NULL,
         duration_minutes INTEGER NOT NULL,
         description TEXT DEFAULT '',
         is_active INTEGER DEFAULT 1,
         sort_order INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT (datetime('now','localtime')))""")
+        created_at TEXT DEFAULT (datetime('now','localtime'))
+    )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS payment_methods(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         method TEXT NOT NULL,
         number TEXT NOT NULL,
         account_name TEXT DEFAULT '',
-        is_active INTEGER DEFAULT 1)""")
+        is_active INTEGER DEFAULT 1
+    )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS payment_orders(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,7 +112,8 @@ def init_db():
         voucher_pin TEXT,
         notes TEXT DEFAULT '',
         created_at TEXT DEFAULT (datetime('now','localtime')),
-        verified_at TEXT)""")
+        verified_at TEXT
+    )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS messages(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,63 +123,65 @@ def init_db():
         reply TEXT DEFAULT '',
         created_at TEXT DEFAULT (datetime('now','localtime')),
         replied_at TEXT,
-        is_read INTEGER DEFAULT 0)""")
+        is_read INTEGER DEFAULT 0
+    )""")
 
-    # Auto-migration for existing tables with older schemas
-    def add_column_if_missing(table, col, col_type):
+    # Auto-migration for existing tables
+    def add_col(tbl, col, ctype):
         try:
-            cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
+            cols = [r[1] for r in c.execute(f"PRAGMA table_info({tbl})").fetchall()]
             if col not in cols:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ctype}")
         except Exception:
             pass
 
-    add_column_if_missing("active_sessions", "package_id", "INTEGER")
-    add_column_if_missing("active_sessions", "expires_at", "TEXT")
-    add_column_if_missing("vouchers", "source", "TEXT DEFAULT 'manual'")
-    add_column_if_missing("vouchers", "order_id", "TEXT")
+    add_col("active_sessions", "package_id", "INTEGER")
+    add_col("active_sessions", "expires_at", "TEXT")
+    add_col("vouchers", "source", "TEXT DEFAULT 'manual'")
+    add_col("vouchers", "order_id", "TEXT")
 
-    # Default admin
+    # Default admin: admin / admin
     if not c.execute("SELECT id FROM admin_users WHERE username='admin'").fetchone():
         c.execute("INSERT INTO admin_users(username,password_hash) VALUES(?,?)",
                   ("admin", generate_password_hash("admin")))
-        print("[*] Default admin -> username: admin | password: admin")
+        print("[*] Default admin created -> User: admin | Pass: admin")
 
-    # Default settings
-    for k, v in {
+    # Default Settings
+    defaults = {
         "site_name": "WiFi Hotspot Portal",
         "site_subtitle": "High Speed Wireless Network",
-        "welcome_text": "একটি প্ল্যান বেছে নিন এবং ইন্টারনেট উপভোগ করুন।",
-        "footer_text": "সমস্যায় অ্যাডমিনের সাথে যোগাযোগ করুন।",
+        "welcome_text": "একটি প্যাকেজ নির্বাচন করুন অথবা ৪-ডিজিটের ভাউচার পিন দিয়ে কানেক্ট করুন।",
+        "footer_text": "কোনো সমস্যায় অ্যাডমিনের সাথে যোগাযোগ করুন।",
         "hotspot_name": "MikroTik HotSpot",
         "primary_color": "#007bff",
         "gateway_ip": "192.168.43.1",
-        "contact_whatsapp": "",
-        "auto_approve": "0",
-    }.items():
+        "auto_approve": "1",
+    }
+    for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO site_settings(key,value) VALUES(?,?)", (k, v))
 
-    # Default packages
+    # Default Packages
     if not c.execute("SELECT COUNT(*) FROM packages").fetchone()[0]:
         for nm, pr, dur, desc, srt in [
-            ("বেসিক — ১ টাকা",  1.0,  10,  "১০ মিনিটের ইন্টারনেট প্যাকেজ", 1),
-            ("স্ট্যান্ডার্ড — ২ টাকা", 2.0, 30, "৩০ মিনিটের ইন্টারনেট প্যাকেজ", 2),
-            ("প্রিমিয়াম — ৫ টাকা", 5.0, 60,  "১ ঘণ্টার আনলিমিটেড প্যাকেজ",   3),
+            ("বেসিক — ১ টাকা",  1.0,  10,  "১০ মিনিটের হাই-স্পিড ইন্টারনেট", 1),
+            ("স্ট্যান্ডার্ড — ২ টাকা", 2.0, 30, "৩০ মিনিটের আনলিমিটেড ইন্টারনেট", 2),
+            ("সুপার — ৫ টাকা",  5.0, 60,  "১ ঘণ্টার সম্পূর্ণ আনলিমিটেড প্যাকেজ", 3),
         ]:
             c.execute("INSERT INTO packages(name,price,duration_minutes,description,sort_order) VALUES(?,?,?,?,?)",
                       (nm, pr, dur, desc, srt))
 
-    # Default payment methods
+    # Default Payment Methods
     if not c.execute("SELECT COUNT(*) FROM payment_methods").fetchone()[0]:
         c.execute("INSERT INTO payment_methods(method,number,account_name) VALUES(?,?,?)",
-                  ("bkash",  "01XXXXXXXXX", "অ্যাডমিন"))
+                  ("bkash", "01XXXXXXXXX", "হটস্পট অ্যাডমিন"))
         c.execute("INSERT INTO payment_methods(method,number,account_name) VALUES(?,?,?)",
-                  ("nagad",  "01XXXXXXXXX", "অ্যাডমিন"))
+                  ("nagad", "01XXXXXXXXX", "হটস্পট অ্যাডমিন"))
 
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Helper Functions & Network Controllers
 # ─────────────────────────────────────────────────────────────────────────────
 def get_settings():
     conn = get_db()
@@ -164,7 +193,28 @@ def client_ip():
     xff = request.headers.get("X-Forwarded-For")
     return xff.split(",")[0].strip() if xff else (request.remote_addr or "127.0.0.1")
 
+def _allow_internet_ip(ip):
+    """Adds firewall exception for authenticated client IP in iptables (Root mode)."""
+    if os.name != "nt":
+        for cmd in [
+            ["iptables", "-I", "FORWARD", "1", "-s", ip, "-j", "ACCEPT"],
+            ["iptables", "-I", "FORWARD", "1", "-d", ip, "-j", "ACCEPT"],
+            ["iptables", "-t", "nat", "-I", "PREROUTING", "1", "-s", ip, "-j", "ACCEPT"],
+        ]:
+            subprocess.run(cmd, capture_output=True)
+
+def _revoke_internet_ip(ip):
+    """Revokes firewall exception for client IP in iptables when expired or logged out."""
+    if os.name != "nt":
+        for cmd in [
+            ["iptables", "-D", "FORWARD", "-s", ip, "-j", "ACCEPT"],
+            ["iptables", "-D", "FORWARD", "-d", ip, "-j", "ACCEPT"],
+            ["iptables", "-t", "nat", "-D", "PREROUTING", "-s", ip, "-j", "ACCEPT"],
+        ]:
+            subprocess.run(cmd, capture_output=True)
+
 def is_authenticated(ip):
+    """Checks if client IP is actively logged in and not expired."""
     conn = get_db()
     row = conn.execute("SELECT id,expires_at FROM active_sessions WHERE client_ip=?", (ip,)).fetchone()
     conn.close()
@@ -175,30 +225,13 @@ def is_authenticated(ip):
             if datetime.now() > datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S"):
                 conn2 = get_db()
                 conn2.execute("DELETE FROM active_sessions WHERE client_ip=?", (ip,))
-                conn2.commit(); conn2.close()
-                _revoke(ip)
+                conn2.commit()
+                conn2.close()
+                _revoke_internet_ip(ip)
                 return False
         except Exception:
             pass
     return True
-
-def _allow(ip):
-    if os.name != "nt":
-        for cmd in [
-            ["iptables", "-I", "FORWARD", "-s", ip, "-j", "ACCEPT"],
-            ["iptables", "-I", "FORWARD", "-d", ip, "-j", "ACCEPT"],
-            ["iptables", "-t","nat","-I","PREROUTING","-s",ip,"-j","ACCEPT"],
-        ]:
-            subprocess.run(cmd, capture_output=True)
-
-def _revoke(ip):
-    if os.name != "nt":
-        for cmd in [
-            ["iptables", "-D", "FORWARD", "-s", ip, "-j", "ACCEPT"],
-            ["iptables", "-D", "FORWARD", "-d", ip, "-j", "ACCEPT"],
-            ["iptables", "-t","nat","-D","PREROUTING","-s",ip,"-j","ACCEPT"],
-        ]:
-            subprocess.run(cmd, capture_output=True)
 
 def gen_order_id():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
@@ -219,7 +252,7 @@ def admin_required(f):
     @wraps(f)
     def w(*a, **kw):
         if not session.get("admin_logged_in"):
-            flash("অনুগ্রহ করে লগইন করুন।", "danger")
+            flash("অনুগ্রহ করে আগে অ্যাডমিন প্যানেলে লগইন করুন।", "danger")
             return redirect(url_for("admin_login"))
         return f(*a, **kw)
     return w
@@ -232,108 +265,145 @@ def pending_counts():
     return pm, um
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CSS
+# Background Session Expiration Worker Thread
+# ─────────────────────────────────────────────────────────────────────────────
+def expiration_worker():
+    """Background thread that automatically checks and cleans expired user sessions."""
+    while True:
+        try:
+            time.sleep(5)
+            conn = get_db()
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            expired_sessions = conn.execute(
+                "SELECT client_ip FROM active_sessions WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now_str,)
+            ).fetchall()
+            if expired_sessions:
+                for s in expired_sessions:
+                    ip = s["client_ip"]
+                    conn.execute("DELETE FROM active_sessions WHERE client_ip=?", (ip,))
+                    _revoke_internet_ip(ip)
+                conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS Design & Styles
 # ─────────────────────────────────────────────────────────────────────────────
 def base_css(primary="#007bff"):
     return f"""
-:root{{--p:{primary};--dark:#1b263b;--surface:#fff;--success:#28a745;
---danger:#dc3545;--warning:#ffc107;--border:#e2e8f0;--text:#2d3748;
---muted:#718096;--r:12px;--sh:0 8px 24px -4px rgba(0,0,0,.12)}}
-*{{margin:0;padding:0;box-sizing:border-box;
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}}
-body{{background:#f4f6f9;color:var(--text);min-height:100vh}}
-a{{color:var(--p);text-decoration:none}}
-.navbar{{background:var(--dark);color:#fff;padding:12px 22px;
-  display:flex;justify-content:space-between;align-items:center;
-  box-shadow:0 2px 8px rgba(0,0,0,.2);flex-wrap:wrap;gap:8px}}
-.brand{{font-size:1.1rem;font-weight:700;color:#fff;display:flex;align-items:center;gap:7px}}
-.nav-links{{display:flex;align-items:center;gap:8px;flex-wrap:wrap}}
-.nav-link{{color:#cbd5e0;font-size:.83rem;padding:5px 10px;border-radius:6px;transition:.2s;position:relative}}
-.nav-link:hover,.nav-link.active{{color:#fff;background:rgba(255,255,255,.12)}}
-.nav-badge{{background:var(--danger);color:#fff;font-size:.65rem;font-weight:700;
-  padding:2px 5px;border-radius:10px;position:absolute;top:-4px;right:-4px}}
-.btn-logout{{background:var(--danger);color:#fff;padding:5px 12px;
-  border-radius:6px;font-size:.82rem;font-weight:600}}
-.container{{max-width:1100px;margin:26px auto;padding:0 16px;width:100%}}
-.card{{background:#fff;border-radius:var(--r);padding:22px;
-  box-shadow:var(--sh);border:1px solid var(--border);margin-bottom:20px}}
-.card h3{{margin-bottom:13px;font-size:1rem;color:var(--dark)}}
-.form-group{{margin-bottom:15px}}
-label{{display:block;margin-bottom:5px;font-size:.86rem;font-weight:600}}
-.form-control{{width:100%;padding:10px 14px;border:1.5px solid var(--border);
-  border-radius:8px;font-size:.95rem;outline:none;transition:.2s;background:#fff}}
-.form-control:focus{{border-color:var(--p);box-shadow:0 0 0 3px rgba(0,123,255,.15)}}
-.btn{{display:inline-block;padding:10px 18px;font-size:.9rem;font-weight:600;
-  border-radius:8px;cursor:pointer;border:none;text-align:center;transition:.2s;line-height:1.4}}
-.btn-primary{{background:var(--p);color:#fff}}.btn-primary:hover{{opacity:.9}}
-.btn-success{{background:var(--success);color:#fff}}.btn-success:hover{{opacity:.9}}
-.btn-danger{{background:var(--danger);color:#fff}}.btn-danger:hover{{opacity:.9}}
-.btn-warning{{background:var(--warning);color:#333}}
-.btn-secondary{{background:#6c757d;color:#fff}}
-.btn-info{{background:#17a2b8;color:#fff}}
-.btn-block{{width:100%}}.btn-sm{{padding:5px 10px;font-size:.78rem}}
-.alert{{padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:.87rem}}
-.alert-success{{background:#d4edda;color:#155724;border:1px solid #c3e6cb}}
-.alert-danger{{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb}}
-.alert-warning{{background:#fff3cd;color:#856404;border:1px solid #ffeeba}}
-.alert-info{{background:#d1ecf1;color:#0c5460;border:1px solid #bee5eb}}
-.badge{{display:inline-block;padding:3px 9px;border-radius:20px;
-  font-size:.7rem;font-weight:700;text-transform:uppercase}}
-.badge-success{{background:var(--success);color:#fff}}
-.badge-danger{{background:var(--danger);color:#fff}}
-.badge-warning{{background:var(--warning);color:#333}}
-.badge-secondary{{background:#6c757d;color:#fff}}
-.badge-primary{{background:var(--p);color:#fff}}
-.badge-info{{background:#17a2b8;color:#fff}}
-.table-responsive{{overflow-x:auto}}
-table{{width:100%;border-collapse:collapse}}
-th,td{{padding:10px 13px;text-align:left;border-bottom:1px solid var(--border);font-size:.86rem}}
-th{{background:#f8fafc;color:var(--muted);font-weight:600}}
-tr:hover td{{background:#f8fafc}}
-.stats-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:20px}}
-.stat-box{{background:#fff;border-radius:var(--r);padding:16px;
-  border:1px solid var(--border);box-shadow:0 2px 6px rgba(0,0,0,.04);border-left:5px solid var(--p)}}
-.stat-box.green{{border-left-color:var(--success)}}.stat-box.orange{{border-left-color:var(--warning)}}
-.stat-box.red{{border-left-color:var(--danger)}}.stat-box.purple{{border-left-color:#6f42c1}}
-.stat-box h3{{font-size:1.65rem;margin-bottom:3px;color:var(--dark)}}
-.stat-box p{{font-size:.79rem;color:var(--muted);font-weight:500}}
-.voucher-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:11px;margin-top:12px}}
-.voucher-card{{border:2px dashed var(--p);background:#f0f7ff;padding:12px;border-radius:8px;text-align:center}}
-.voucher-card .pin{{font-size:1.5rem;font-weight:800;letter-spacing:5px;color:var(--dark);margin:5px 0}}
-pre.terminal{{background:#0d1117;color:#3fb950;padding:13px;border-radius:8px;
-  font-family:monospace;font-size:.82rem;overflow-x:auto;line-height:1.6;margin:7px 0}}
-.pkg-cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;margin:18px 0}}
-.pkg-card{{background:#fff;border:2px solid var(--border);border-radius:14px;
-  padding:22px 18px;text-align:center;cursor:pointer;transition:.25s;position:relative}}
-.pkg-card:hover{{border-color:var(--p);transform:translateY(-3px);box-shadow:0 12px 28px rgba(0,0,0,.12)}}
-.pkg-card.popular{{border-color:var(--p)}}
-.pkg-price{{font-size:2rem;font-weight:800;color:var(--p);margin:10px 0 5px}}
-.pkg-dur{{font-size:.88rem;color:var(--muted);margin-bottom:12px}}
-.pkg-badge{{position:absolute;top:-10px;right:14px;background:var(--p);
-  color:#fff;padding:3px 10px;border-radius:20px;font-size:.72rem;font-weight:700}}
-.pay-method-btn{{display:flex;align-items:center;gap:12px;padding:14px 16px;
-  border:2px solid var(--border);border-radius:10px;cursor:pointer;margin-bottom:10px;
-  transition:.2s;background:#fff}}
-.pay-method-btn:hover,.pay-method-btn.selected{{border-color:var(--p);background:#f0f7ff}}
-.pay-method-btn .icon{{font-size:1.6rem}}
-.pay-method-btn .info{{text-align:left}}
-.pay-method-btn .info strong{{display:block;font-size:.95rem}}
-.pay-method-btn .info small{{color:var(--muted);font-size:.8rem}}
-.order-status-box{{text-align:center;padding:30px 20px}}
-.order-status-box .status-icon{{font-size:52px;margin-bottom:12px}}
-.timer-box{{background:linear-gradient(135deg,#0d1b2a,#1b263b);color:#fff;
-  border-radius:12px;padding:16px;text-align:center;margin:16px 0}}
-.timer-box .time{{font-size:2rem;font-weight:800;color:#4ade80;font-family:monospace}}
-.msg-bubble{{background:#f0f7ff;border:1px solid var(--border);border-radius:10px;
-  padding:12px 14px;margin-bottom:10px;font-size:.88rem}}
-.msg-bubble.reply{{background:#f0fff4;border-color:#c3e6cb;margin-left:20px}}
-@media(max-width:600px){{
-  .navbar{{flex-direction:column;text-align:center}}
-  .pkg-cards{{grid-template-columns:1fr}}
-}}"""
+:root {{
+    --p: {primary};
+    --dark: #1b263b;
+    --surface: #ffffff;
+    --success: #28a745;
+    --danger: #dc3545;
+    --warning: #ffc107;
+    --border: #e2e8f0;
+    --text: #2d3748;
+    --muted: #718096;
+    --r: 12px;
+    --sh: 0 8px 24px -4px rgba(0,0,0,.12);
+}}
+* {{ margin:0; padding:0; box-sizing:border-box; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif; }}
+body {{ background:#f4f6f9; color:var(--text); min-height:100vh; }}
+a {{ color:var(--p); text-decoration:none; }}
+
+/* Navbar */
+.navbar {{ background:var(--dark); color:#fff; padding:12px 20px; display:flex; justify-content:space-between; align-items:center; box-shadow:0 2px 8px rgba(0,0,0,.2); flex-wrap:wrap; gap:8px; }}
+.brand {{ font-size:1.1rem; font-weight:700; color:#fff; display:flex; align-items:center; gap:7px; }}
+.nav-links {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+.nav-link {{ color:#cbd5e0; font-size:.83rem; padding:5px 10px; border-radius:6px; transition:.2s; position:relative; }}
+.nav-link:hover, .nav-link.active {{ color:#fff; background:rgba(255,255,255,.12); }}
+.nav-badge {{ background:var(--danger); color:#fff; font-size:.65rem; font-weight:700; padding:2px 5px; border-radius:10px; position:absolute; top:-4px; right:-4px; }}
+.btn-logout {{ background:var(--danger); color:#fff; padding:5px 12px; border-radius:6px; font-size:.82rem; font-weight:600; }}
+
+/* Container & Cards */
+.container {{ max-width:1100px; margin:24px auto; padding:0 16px; width:100%; }}
+.card {{ background:#fff; border-radius:var(--r); padding:22px; box-shadow:var(--sh); border:1px solid var(--border); margin-bottom:20px; }}
+.card h3 {{ margin-bottom:13px; font-size:1.05rem; color:var(--dark); }}
+
+/* Forms & Inputs */
+.form-group {{ margin-bottom:15px; }}
+label {{ display:block; margin-bottom:5px; font-size:.86rem; font-weight:600; }}
+.form-control {{ width:100%; padding:10px 14px; border:1.5px solid var(--border); border-radius:8px; font-size:.95rem; outline:none; transition:.2s; background:#fff; }}
+.form-control:focus {{ border-color:var(--p); box-shadow:0 0 0 3px rgba(0,123,255,.15); }}
+
+/* Buttons */
+.btn {{ display:inline-block; padding:10px 18px; font-size:.9rem; font-weight:600; border-radius:8px; cursor:pointer; border:none; text-align:center; transition:.2s; line-height:1.4; }}
+.btn-primary {{ background:var(--p); color:#fff; }} .btn-primary:hover {{ opacity:.9; }}
+.btn-success {{ background:var(--success); color:#fff; }} .btn-success:hover {{ opacity:.9; }}
+.btn-danger {{ background:var(--danger); color:#fff; }} .btn-danger:hover {{ opacity:.9; }}
+.btn-warning {{ background:var(--warning); color:#333; }}
+.btn-secondary {{ background:#6c757d; color:#fff; }}
+.btn-info {{ background:#17a2b8; color:#fff; }}
+.btn-block {{ width:100%; }}
+.btn-sm {{ padding:5px 10px; font-size:.78rem; }}
+
+/* Alerts & Badges */
+.alert {{ padding:10px 14px; border-radius:8px; margin-bottom:16px; font-size:.87rem; }}
+.alert-success {{ background:#d4edda; color:#155724; border:1px solid #c3e6cb; }}
+.alert-danger {{ background:#f8d7da; color:#721c24; border:1px solid #f5c6cb; }}
+.alert-warning {{ background:#fff3cd; color:#856404; border:1px solid #ffeeba; }}
+.alert-info {{ background:#d1ecf1; color:#0c5460; border:1px solid #bee5eb; }}
+
+.badge {{ display:inline-block; padding:3px 9px; border-radius:20px; font-size:.7rem; font-weight:700; text-transform:uppercase; }}
+.badge-success {{ background:var(--success); color:#fff; }}
+.badge-danger {{ background:var(--danger); color:#fff; }}
+.badge-warning {{ background:var(--warning); color:#333; }}
+.badge-secondary {{ background:#6c757d; color:#fff; }}
+.badge-primary {{ background:var(--p); color:#fff; }}
+.badge-info {{ background:#17a2b8; color:#fff; }}
+
+/* Tables */
+.table-responsive {{ overflow-x:auto; }}
+table {{ width:100%; border-collapse:collapse; }}
+th, td {{ padding:10px 13px; text-align:left; border-bottom:1px solid var(--border); font-size:.86rem; }}
+th {{ background:#f8fafc; color:var(--muted); font-weight:600; }}
+tr:hover td {{ background:#f8fafc; }}
+
+/* Stats Grid */
+.stats-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:16px; margin-bottom:20px; }}
+.stat-box {{ background:#fff; border-radius:var(--r); padding:16px; border:1px solid var(--border); box-shadow:0 2px 6px rgba(0,0,0,.04); border-left:5px solid var(--p); }}
+.stat-box.green {{ border-left-color:var(--success); }}
+.stat-box.orange {{ border-left-color:var(--warning); }}
+.stat-box.red {{ border-left-color:var(--danger); }}
+.stat-box.purple {{ border-left-color:#6f42c1; }}
+.stat-box h3 {{ font-size:1.65rem; margin-bottom:3px; color:var(--dark); }}
+.stat-box p {{ font-size:.79rem; color:var(--muted); font-weight:500; }}
+
+/* Package Cards */
+.pkg-cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; margin:16px 0; }}
+.pkg-card {{ background:#fff; border:2px solid var(--border); border-radius:14px; padding:20px 16px; text-align:center; cursor:pointer; transition:.25s; position:relative; }}
+.pkg-card:hover {{ border-color:var(--p); transform:translateY(-3px); box-shadow:0 12px 28px rgba(0,0,0,.12); }}
+.pkg-card.popular {{ border-color:var(--p); }}
+.pkg-price {{ font-size:1.9rem; font-weight:800; color:var(--p); margin:8px 0 4px; }}
+.pkg-dur {{ font-size:.85rem; color:var(--muted); margin-bottom:10px; }}
+.pkg-badge {{ position:absolute; top:-10px; right:14px; background:var(--p); color:#fff; padding:3px 10px; border-radius:20px; font-size:.7rem; font-weight:700; }}
+
+/* Voucher Grid Preview */
+.voucher-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(155px,1fr)); gap:11px; margin-top:12px; }}
+.voucher-card {{ border:2px dashed var(--p); background:#f0f7ff; padding:12px; border-radius:8px; text-align:center; }}
+.voucher-card .pin {{ font-size:1.5rem; font-weight:800; letter-spacing:5px; color:var(--dark); margin:5px 0; }}
+
+/* Timer Display */
+.timer-box {{ background:linear-gradient(135deg,#0d1b2a,#1b263b); color:#fff; border-radius:12px; padding:16px; text-align:center; margin:16px 0; }}
+.timer-box .time {{ font-size:2rem; font-weight:800; color:#4ade80; font-family:monospace; }}
+
+/* Terminal & Messages */
+pre.terminal {{ background:#0d1117; color:#3fb950; padding:13px; border-radius:8px; font-family:monospace; font-size:.82rem; overflow-x:auto; line-height:1.6; margin:7px 0; }}
+.msg-bubble {{ background:#f0f7ff; border:1px solid var(--border); border-radius:10px; padding:12px 14px; margin-bottom:10px; font-size:.88rem; }}
+.msg-bubble.reply {{ background:#f0fff4; border-color:#c3e6cb; margin-left:20px; }}
+
+@media(max-width:600px) {{
+    .navbar {{ flex-direction:column; text-align:center; }}
+    .pkg-cards {{ grid-template-columns:1fr; }}
+}}
+"""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Admin Base & Renderer
+# Admin Layout Renderer
 # ─────────────────────────────────────────────────────────────────────────────
 ADMIN_BASE = """<!DOCTYPE html>
 <html lang="bn"><head>
@@ -372,29 +442,55 @@ def render_admin(title, ap, html):
         page_content=html, po=po, um=um)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ══  USER TEMPLATES  ══
+# ══  USER PORTAL TEMPLATES  ══
 # ─────────────────────────────────────────────────────────────────────────────
-PACKAGES_TMPL = """<!DOCTYPE html><html lang="bn"><head>
+PORTAL_MAIN_TMPL = """<!DOCTYPE html><html lang="bn"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>{{ s.site_name }}</title><style>{{ css|safe }}
-body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;align-items:flex-start;
-  justify-content:center;padding:20px 14px;min-height:100vh}
-.portal-wrap{width:100%;max-width:520px}
-.portal-head{background:{{ s.primary_color }};border-radius:16px 16px 0 0;
-  padding:24px 18px;color:#fff;text-align:center}
-.portal-head .icon{font-size:38px;margin-bottom:6px}
-.portal-head h2{font-size:1.25rem;font-weight:700}
-.portal-head p{font-size:.8rem;opacity:.9;margin-top:2px}
-.portal-body{background:#fff;border-radius:0 0 16px 16px;padding:22px 18px}
-.pin-box{background:#f8fafc;border:2px solid #cbd5e0;border-radius:12px;padding:18px;margin-bottom:20px;text-align:center}
-.pin-input{letter-spacing:14px;font-size:2rem;text-align:center;font-weight:800;height:60px;border:2px solid var(--border);border-radius:10px;color:var(--dark);margin-bottom:12px}
-.pin-input:focus{border-color:var(--p)}
-.divider{display:flex;align-items:center;text-align:center;margin:20px 0;color:var(--muted);font-size:.8rem;font-weight:600}
-.divider::before,.divider::after{content:'';flex:1;border-bottom:1px solid var(--border)}
-.divider:not(:empty)::before{margin-right:.8em}
-.divider:not(:empty)::after{margin-left:.8em}
-.section-title{font-size:.85rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;text-align:center}
-.contact-link{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:14px;padding:11px;background:#fff3cd;border:1px solid #ffeeba;border-radius:8px;font-size:.83rem;color:#856404;text-decoration:none}
+body {
+  background: linear-gradient(135deg, #0d1b2a 0%, #1b263b 100%);
+  display:flex; align-items:flex-start; justify-content:center;
+  padding:20px 14px; min-height:100vh;
+}
+.portal-wrap { width:100%; max-width:500px; }
+.portal-head {
+  background: {{ s.primary_color }}; border-radius:16px 16px 0 0;
+  padding:24px 18px; color:#fff; text-align:center;
+}
+.portal-head .icon { font-size:38px; margin-bottom:6px; }
+.portal-head h2 { font-size:1.25rem; font-weight:700; }
+.portal-head p { font-size:.8rem; opacity:.9; margin-top:2px; }
+.portal-body { background:#fff; border-radius:0 0 16px 16px; padding:22px 18px; }
+
+/* 4-Digit PIN Box */
+.pin-box {
+  background:#f8fafc; border:2px solid #cbd5e0; border-radius:12px;
+  padding:18px; margin-bottom:20px; text-align:center;
+}
+.pin-input {
+  letter-spacing:14px; font-size:2rem; text-align:center;
+  font-weight:800; height:60px; border:2px solid var(--border);
+  border-radius:10px; color:var(--dark); margin-bottom:12px;
+}
+.pin-input:focus { border-color:var(--p); }
+
+.divider {
+  display:flex; align-items:center; text-align:center;
+  margin:20px 0; color:var(--muted); font-size:.8rem; font-weight:600;
+}
+.divider::before, .divider::after { content:''; flex:1; border-bottom:1px solid var(--border); }
+.divider:not(:empty)::before { margin-right:.8em; }
+.divider:not(:empty)::after { margin-left:.8em; }
+
+.section-title {
+  font-size:.85rem; font-weight:700; color:var(--muted);
+  text-transform:uppercase; letter-spacing:.5px; margin-bottom:12px; text-align:center;
+}
+.contact-link {
+  display:flex; align-items:center; justify-content:center; gap:8px;
+  margin-top:14px; padding:11px; background:#fff3cd; border:1px solid #ffeeba;
+  border-radius:8px; font-size:.83rem; color:#856404; text-decoration:none;
+}
 </style></head><body>
 <div class="portal-wrap">
   <div class="portal-head">
@@ -407,14 +503,17 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;align-items
       {% for cat,msg in msgs %}<div class="alert alert-{{cat}}">{{msg}}</div>{% endfor %}
     {% endwith %}
 
-    <!-- 1. Instant 4-Digit PIN Voucher Login -->
+    <!-- 1. Instant 4-Digit PIN Voucher Login Box -->
     <div class="pin-box">
-      <div style="font-size:.92rem;font-weight:700;color:var(--dark);margin-bottom:8px">🎟️ আপনার ৪-ডিজিট ভাউচার পিন দিন</div>
+      <div style="font-size:.92rem;font-weight:700;color:var(--dark);margin-bottom:8px">
+        🎟️ আপনার ৪-ডিজিট ভাউচার পিন দিন
+      </div>
       <form method="POST" action="{{ url_for('login') }}">
         <input name="pin" class="form-control pin-input"
                placeholder="••••" maxlength="4" inputmode="numeric"
                pattern="[0-9]{4}" required autofocus>
-        <button type="submit" class="btn btn-primary btn-block" style="padding:13px;font-size:1.05rem;background:{{ s.primary_color }}">
+        <button type="submit" class="btn btn-primary btn-block"
+                style="padding:13px;font-size:1.05rem;background:{{ s.primary_color }}">
           🚀 ইন্টারনেট চালু করুন (Connect)
         </button>
       </form>
@@ -423,12 +522,12 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;align-items
     <div class="divider">অথবা ভাউচার পিন কিনুন (বিকাশ / নগদ)</div>
 
     <!-- 2. Package Plans -->
-    <div class="section-title">প্যাকেজ বেছে নিয়ে পিন সংগ্রহ করুন</div>
+    <div class="section-title">প্যাকেজ বেছে নিয়ে পিন সংগ্রহ করুন</div>
     <div class="pkg-cards">
       {% for pkg in packages %}
       <a href="{{ url_for('order_page', pkg_id=pkg.id) }}" style="text-decoration:none">
         <div class="pkg-card {% if loop.index==2 %}popular{% endif %}">
-          {% if loop.index==2 %}<div class="pkg-badge">জনপ্রিয়</div>{% endif %}
+          {% if loop.index==2 %}<div class="pkg-badge">জনপ্রিয়</div>{% endif %}
           <div style="font-size:1.02rem;font-weight:700;color:var(--dark)">{{ pkg.name }}</div>
           <div class="pkg-price">৳{{ "%.0f"|format(pkg.price) }}</div>
           <div class="pkg-dur">⏱ {{ pkg.duration_minutes }} মিনিট</div>
@@ -439,7 +538,7 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;align-items
         </div>
       </a>
       {% else %}
-      <div class="alert alert-warning">কোনো প্যাকেজ পাওয়া যায়নি।</div>
+      <div class="alert alert-warning">কোনো প্যাকেজ পাওয়া যায়নি।</div>
       {% endfor %}
     </div>
 
@@ -492,25 +591,24 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
       {% if m.method=='bkash' %}🔴 বিকাশ নম্বর{% elif m.method=='nagad' %}🟠 নগদ নম্বর{% else %}💳 {{ m.method }}{% endif %}
     </div>
     <div class="pay-num-box">{{ m.number }}</div>
-    <p style="font-size:.8rem;color:var(--muted);margin-bottom:14px">অ্যাকাউন্ট: <strong>{{ m.account_name }}</strong></p>
+    <p style="font-size:.8rem;color:var(--muted);margin-bottom:14px">অ্যাকাউন্ট নাম: <strong>{{ m.account_name }}</strong></p>
     {% endfor %}
 
     <div class="step-box">
-      📋 <strong>পেমেন্টের ধাপ:</strong><br>
+      📋 <strong>পেমেন্ট করার নিয়ম:</strong><br>
       ১. উপরের নম্বরে <strong>৳{{ "%.0f"|format(pkg.price) }}</strong> Send Money করুন<br>
-      ২. পেমেন্ট সফল হলে Transaction ID পাবেন<br>
-      ৩. নিচের ফর্মে Transaction ID টি দিন<br>
-      ৪. অ্যাডমিন ভেরিফাই করলে আপনার ভাউচার কোড দেওয়া হবে
+      ২. বিকাশ/নগদ ফিরতি মেসেজ থেকে Transaction ID টি কপি করুন<br>
+      ৩. নিচের বক্সে Transaction ID দিয়ে সাবমিট করলেই ভাউচার পিন পেয়ে যাবেন
     </div>
 
     <form method="POST" action="{{ url_for('submit_order') }}">
       <input type="hidden" name="package_id" value="{{ pkg.id }}">
       <div class="form-group">
         <label>আপনার নাম (ঐচ্ছিক)</label>
-        <input name="client_name" class="form-control" placeholder="আপনার নাম লিখুন">
+        <input name="client_name" class="form-control" placeholder="নাম লিখুন">
       </div>
       <div class="form-group">
-        <label>পেমেন্ট পদ্ধতি</label>
+        <label>পেমেন্ট মেথড</label>
         <select name="payment_method" class="form-control" required>
           {% for m in methods %}
           <option value="{{ m.method }}">
@@ -524,9 +622,6 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
         <label>ট্রানজেকশন আইডি (TxnID / Reference)</label>
         <input name="transaction_id" class="form-control"
                placeholder="যেমন: 8H4XJ2P9LM" required>
-        <small style="color:var(--muted);font-size:.78rem">
-          বিকাশ/নগদ SMS-এ পাওয়া Transaction ID বা Reference নম্বর
-        </small>
       </div>
       <button type="submit" class="btn btn-success btn-block" style="padding:13px;font-size:1rem">
         ✅ পেমেন্ট সাবমিট করুন
@@ -541,9 +636,6 @@ ORDER_STATUS_TMPL = """<!DOCTYPE html><html lang="bn"><head>
 body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
   align-items:center;justify-content:center;padding:24px 16px;min-height:100vh}
 .card{max-width:440px;width:100%;text-align:center}
-.order-id-box{background:#f8fafc;border:1.5px dashed var(--border);
-  border-radius:8px;padding:10px;font-family:monospace;font-size:1.1rem;
-  font-weight:700;letter-spacing:3px;color:var(--dark);margin:14px 0}
 .pin-big{font-size:2.5rem;font-weight:900;letter-spacing:8px;
   color:var(--success);background:#d4edda;padding:14px 20px;
   border-radius:12px;border:2px solid #c3e6cb;display:inline-block;
@@ -561,20 +653,20 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
       <div class="spinner"></div>
       <h2 style="color:var(--warning)">⏳ পেমেন্ট যাচাই হচ্ছে…</h2>
       <p style="color:var(--muted);font-size:.88rem;margin-top:8px">
-        অ্যাডমিন আপনার পেমেন্ট ভেরিফাই করছেন। কিছুক্ষণ অপেক্ষা করুন।
+        অ্যাডমিন পেমেন্ট ভেরিফাই করলেই আপনার ভাউচার পিন স্ক্রিনে চলে আসবে।
       </p>
     {% elif order.status == 'verified' %}
       <div style="font-size:52px">🎉</div>
-      <h2 style="color:var(--success);margin-top:8px">পেমেন্ট অনুমোদিত!</h2>
-      <p style="color:var(--muted);font-size:.88rem;margin:6px 0 4px">আপনার ভাউচার কোড:</p>
+      <h2 style="color:var(--success);margin-top:8px">পেমেন্ট সফল হয়েছে!</h2>
+      <p style="color:var(--muted);font-size:.88rem;margin:6px 0 4px">আপনার ৪-ডিজিট ভাউচার পিন:</p>
       <div class="pin-big">{{ order.voucher_pin }}</div>
       <p style="font-size:.82rem;color:var(--muted);margin-bottom:14px">
-        এই কোডটি সেভ করুন — পরেও ব্যবহার করতে পারবেন।
+        নিচের বাটনে চাপ দিয়ে সরাসরি ইন্টারনেট চালু করুন:
       </p>
       <form method="POST" action="{{ url_for('login') }}">
         <input type="hidden" name="pin" value="{{ order.voucher_pin }}">
         <button type="submit" class="btn btn-success btn-block" style="padding:13px;font-size:1.05rem">
-          🚀 এখনই কানেক্ট করুন
+          🚀 এখনই ইন্টারনেট চালু করুন
         </button>
       </form>
     {% elif order.status == 'rejected' %}
@@ -586,7 +678,7 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
       </div>
       {% endif %}
       <a href="{{ url_for('portal_index') }}" class="btn btn-primary btn-block" style="margin-top:14px">
-        পুনরায় চেষ্টা করুন
+        পুনরায় চেষ্টা করুন
       </a>
     {% endif %}
 
@@ -594,7 +686,7 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
       <div class="info-row"><span>অর্ডার আইডি</span><strong>{{ order.order_id }}</strong></div>
       <div class="info-row"><span>প্যাকেজ</span><span>{{ order.pkg_name }}</span></div>
       <div class="info-row"><span>পরিমাণ</span><span>৳{{ "%.0f"|format(order.amount) }}</span></div>
-      <div class="info-row"><span>পেমেন্ট</span><span>{{ order.payment_method }}</span></div>
+      <div class="info-row"><span>পেমেন্ট মেথড</span><span>{{ order.payment_method }}</span></div>
       <div class="info-row"><span>TxnID</span><span style="font-family:monospace">{{ order.transaction_id }}</span></div>
     </div>
   </div>
@@ -605,45 +697,10 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
 </div>
 <script>
   {% if order.status == 'pending' %}
-  setTimeout(()=>location.reload(), 6000);
+  setTimeout(()=>location.reload(), 5000);
   {% endif %}
 </script>
 </body></html>"""
-
-VOUCHER_PAGE_TMPL = """<!DOCTYPE html><html lang="bn"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ভাউচার কোড — {{ s.site_name }}</title><style>{{ css|safe }}
-body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
-  align-items:center;justify-content:center;padding:24px 16px;min-height:100vh}
-.card{max-width:400px;width:100%;text-align:center}
-.pin-input{letter-spacing:12px;font-size:1.9rem;text-align:center;
-  font-weight:800;height:60px;border:2px solid var(--border);
-  border-radius:10px;color:var(--dark)}
-.pin-input:focus{border-color:var(--p)}
-</style></head><body>
-<div class="card">
-  <div style="font-size:44px;margin-bottom:12px">🎟️</div>
-  <h2 style="color:#fff;margin-bottom:6px">ভাউচার কোড দিন</h2>
-  <p style="color:#94a3b8;font-size:.86rem;margin-bottom:18px">
-    অ্যাডমিনের দেওয়া বা পেমেন্টের মাধ্যমে পাওয়া ৪-ডিজিট কোড
-  </p>
-  {% with msgs=get_flashed_messages(with_categories=true) %}
-    {% for cat,msg in msgs %}<div class="alert alert-{{cat}}">{{msg}}</div>{% endfor %}
-  {% endwith %}
-  <form method="POST" action="{{ url_for('login') }}">
-    <div class="form-group">
-      <input name="pin" class="form-control pin-input"
-             placeholder="••••" maxlength="4" inputmode="numeric"
-             pattern="[0-9]{4}" required autofocus>
-    </div>
-    <button type="submit" class="btn btn-primary btn-block" style="padding:13px;font-size:1.05rem;background:{{ s.primary_color }}">
-      🚀 কানেক্ট করুন
-    </button>
-  </form>
-  <a href="{{ url_for('portal_index') }}" style="display:block;margin-top:14px;color:#94a3b8;font-size:.82rem">
-    ← প্যাকেজ তালিকায় ফিরুন
-  </a>
-</div></body></html>"""
 
 STATUS_TMPL = """<!DOCTYPE html><html lang="bn"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -656,16 +713,15 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
 .info-tbl td{padding:9px 13px;font-size:.85rem}
 .info-tbl td:first-child{color:var(--muted);font-weight:500}
 .info-tbl td:last-child{text-align:right;font-weight:600}
-.expired-banner{background:var(--danger);color:#fff;padding:10px;border-radius:8px;margin-top:10px}
 </style></head><body>
 <div class="card">
   <div class="check">✓</div>
-  <h2 style="color:var(--success);margin-bottom:5px">ইন্টারনেট চালু!</h2>
-  <p style="color:#94a3b8;font-size:.88rem">আপনি সফলভাবে কানেক্টেড।</p>
+  <h2 style="color:var(--success);margin-bottom:5px">ইন্টারনেট সক্রিয় আছে!</h2>
+  <p style="color:#94a3b8;font-size:.88rem">আপনি সফলভাবে সংযুক্ত আছেন।</p>
 
   {% if sess.expires_at %}
   <div class="timer-box">
-    <div style="font-size:.82rem;opacity:.8;margin-bottom:4px">⏱ সময় বাকি</div>
+    <div style="font-size:.82rem;opacity:.8;margin-bottom:4px">⏱ সময় বাকি আছে</div>
     <div class="time" id="timer">লোড হচ্ছে…</div>
   </div>
   {% endif %}
@@ -673,17 +729,17 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
   <table class="info-tbl">
     <tr><td>IP Address</td><td>{{ sess.client_ip }}</td></tr>
     <tr><td>Voucher PIN</td><td>{{ sess.pin }}</td></tr>
-    <tr><td>লগইন সময়</td><td>{{ sess.login_time }}</td></tr>
+    <tr><td>লগইন সময়</td><td>{{ sess.login_time }}</td></tr>
     {% if sess.expires_at %}
-    <tr><td>মেয়াদ শেষ</td><td id="exp-text">{{ sess.expires_at }}</td></tr>
+    <tr><td>মেয়াদ শেষ</td><td id="exp-text">{{ sess.expires_at }}</td></tr>
     {% else %}
-    <tr><td>মেয়াদ</td><td><span class="badge badge-success">আনলিমিটেড</span></td></tr>
+    <tr><td>মেয়াদ</td><td><span class="badge badge-success">আনলিমিটেড</span></td></tr>
     {% endif %}
     <tr><td>স্ট্যাটাস</td><td><span class="badge badge-success">ONLINE</span></td></tr>
   </table>
 
   <div style="display:flex;gap:10px">
-    <a href="https://www.google.com" class="btn btn-primary" style="flex:1">🌐 Browse</a>
+    <a href="https://www.google.com" class="btn btn-primary" style="flex:1">🌐 Google Browse</a>
     <form method="POST" action="{{ url_for('user_logout') }}" style="flex:1">
       <button class="btn btn-danger btn-block">ডিসকানেক্ট</button>
     </form>
@@ -693,14 +749,15 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
 const expiresAt = "{{ sess.expires_at or '' }}";
 if(expiresAt){
   function tick(){
-    const diff=new Date(expiresAt.replace(' ','T'))-new Date();
-    if(diff<=0){
-      document.getElementById('timer').innerHTML='<span style="color:#f87171">মেয়াদ শেষ!</span>';
-      setTimeout(()=>location.href='/',3000); return;
+    const diff = new Date(expiresAt.replace(' ','T')) - new Date();
+    if(diff <= 0){
+      document.getElementById('timer').innerHTML = '<span style="color:#f87171">মেয়াদ শেষ হয়েছে!</span>';
+      setTimeout(()=>location.href='/', 2000);
+      return;
     }
-    const h=Math.floor(diff/3600000),m=Math.floor(diff%3600000/60000),s=Math.floor(diff%60000/1000);
-    document.getElementById('timer').textContent=(h?h+'ঘ ':'')+m+'মি '+s+'সে';
-    setTimeout(tick,1000);
+    const h = Math.floor(diff/3600000), m = Math.floor(diff%3600000/60000), s = Math.floor(diff%60000/1000);
+    document.getElementById('timer').textContent = (h?h+'ঘ ':'')+m+'মি '+s+'সে';
+    setTimeout(tick, 1000);
   }
   tick();
 }
@@ -717,7 +774,7 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
   <div style="text-align:center;margin-bottom:16px">
     <div style="font-size:40px">💬</div>
     <h2 style="color:#fff;margin-top:8px">অ্যাডমিনের সাথে যোগাযোগ</h2>
-    <p style="color:#94a3b8;font-size:.83rem">আপনার সমস্যা লিখুন, অ্যাডমিন উত্তর দেবেন।</p>
+    <p style="color:#94a3b8;font-size:.83rem">আপনার সমস্যা বা প্রশ্ন লিখুন।</p>
   </div>
   {% with msgs=get_flashed_messages(with_categories=true) %}
     {% for cat,msg in msgs %}<div class="alert alert-{{cat}}">{{msg}}</div>{% endfor %}
@@ -733,7 +790,7 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
   {% if msg.reply %}
   <div class="msg-bubble reply">
     <div style="font-size:.75rem;color:var(--muted);margin-bottom:5px">
-      🔧 <strong>অ্যাডমিন</strong> — {{ msg.replied_at or '' }}
+      🔧 <strong>অ্যাডমিন রিপ্লাই</strong> — {{ msg.replied_at or '' }}
     </div>
     <div>{{ msg.reply }}</div>
   </div>
@@ -748,15 +805,14 @@ body{background:linear-gradient(135deg,#0d1b2a,#1b263b);display:flex;
         <input name="sender_name" class="form-control" placeholder="নাম লিখুন" required>
       </div>
       <div class="form-group">
-        <label>সমস্যা বা বার্তা</label>
-        <textarea name="message" class="form-control" rows="4"
-                  placeholder="আপনার সমস্যা বা প্রশ্ন লিখুন..." required></textarea>
+        <label>বার্তা বা অভিযোগ</label>
+        <textarea name="message" class="form-control" rows="4" placeholder="আপনার বার্তা লিখুন..." required></textarea>
       </div>
       <button type="submit" class="btn btn-primary btn-block">📤 বার্তা পাঠান</button>
     </form>
   </div>
   <a href="{{ url_for('portal_index') }}" style="display:block;text-align:center;
-     margin-top:12px;color:#94a3b8;font-size:.82rem">← পিছনে যান</a>
+     margin-top:12px;color:#94a3b8;font-size:.82rem">← পোর্টালে ফিরুন</a>
 </div></body></html>"""
 
 ADMIN_LOGIN_TMPL = """<!DOCTYPE html><html lang="bn"><head>
@@ -789,49 +845,49 @@ body{background:#0f172a;display:flex;align-items:center;justify-content:center;p
 </div></body></html>"""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ══  ADMIN CONTENT TEMPLATES  ══
+# ══  ADMIN DASHBOARD CONTENT  ══
 # ─────────────────────────────────────────────────────────────────────────────
 DASH_CONTENT = """
 <div class="stats-grid">
   <div class="stat-box"><h3>{{ st.total_pins }}</h3><p>মোট ভাউচার পিন</p></div>
   <div class="stat-box green"><h3>{{ st.active_pins }}</h3><p>অ্যাক্টিভ পিন</p></div>
-  <div class="stat-box orange"><h3>{{ st.pending_orders }}</h3><p>পেন্ডিং পেমেন্ট</p></div>
-  <div class="stat-box red"><h3>{{ st.online }}</h3><p>এখন অনলাইন</p></div>
-  <div class="stat-box purple"><h3>{{ st.total_orders }}</h3><p>মোট পেমেন্ট অর্ডার</p></div>
+  <div class="stat-box orange"><h3>{{ st.pending_orders }}</h3><p>পেন্ডিং অর্ডার</p></div>
+  <div class="stat-box red"><h3>{{ st.online }}</h3><p>অনলাইন ইউজার</p></div>
+  <div class="stat-box purple"><h3>{{ st.total_orders }}</h3><p>মোট বিক্রিত প্যাকেজ</p></div>
 </div>
 
 <div class="card">
-  <h3>⚡ ম্যানুয়াল ভাউচার পিন তৈরি করুন</h3>
+  <h3>⚡ নতুন ৪-ডিজিট ভাউচার পিন জেনারেটর</h3>
   <form method="POST" action="{{ url_for('admin_generate_pin') }}"
         style="display:flex;gap:13px;flex-wrap:wrap;align-items:flex-end">
     <div style="flex:1;min-width:150px">
-      <label>পিন সংখ্যা</label>
+      <label>কতগুলো পিন তৈরি করবেন?</label>
       <select name="count" class="form-control">
         <option value="1">১টি</option><option value="5" selected>৫টি</option>
-        <option value="10">১০টি</option><option value="20">২০টি</option>
+        <option value="10">১০টি</option><option value="20">২০টি</option><option value="50">৫০টি</option>
       </select>
     </div>
     <div style="flex:1;min-width:150px">
       <label>কাস্টম পিন (ঐচ্ছিক)</label>
-      <input name="custom_pin" class="form-control" placeholder="যেমন: 5566" maxlength="4" pattern="[0-9]{4}">
+      <input name="custom_pin" class="form-control" placeholder="যেমন: 7788" maxlength="4" pattern="[0-9]{4}">
     </div>
-    <div><button type="submit" class="btn btn-success" style="height:44px;padding:0 20px">+ তৈরি করুন</button></div>
+    <div><button type="submit" class="btn btn-success" style="height:44px;padding:0 20px">+ পিন তৈরি করুন</button></div>
   </form>
 </div>
 
 <div class="card">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:13px">
-    <h3>🟢 এখন কানেক্টেড ডিভাইস</h3>
-    <span class="badge badge-primary">{{ sessions|length }} টি</span>
+    <h3>🟢 বর্তমানে সংযুক্ত ক্লায়েন্ট (Active Sessions)</h3>
+    <span class="badge badge-primary">{{ sessions|length }} টি ডিভাইস</span>
   </div>
   <div class="table-responsive"><table>
-    <thead><tr><th>IP</th><th>পিন</th><th>প্যাকেজ</th><th>মেয়াদ শেষ</th><th>Action</th></tr></thead>
+    <thead><tr><th>IP Address</th><th>ব্যবহৃত পিন</th><th>প্যাকেজ</th><th>মেয়াদ শেষ</th><th>Action</th></tr></thead>
     <tbody>
     {% for u in sessions %}
     <tr>
       <td><strong>{{ u.client_ip }}</strong></td>
       <td><span class="badge badge-success">{{ u.pin }}</span></td>
-      <td>{{ u.pkg_name or 'ম্যানুয়াল' }}</td>
+      <td>{{ u.pkg_name or 'ম্যানুয়াল' }}</td>
       <td>
         {% if u.expires_at %}
           {% if u.expires_at < now %}
@@ -844,12 +900,12 @@ DASH_CONTENT = """
       <td>
         <form method="POST" action="{{ url_for('admin_kick_user') }}" style="display:inline">
           <input type="hidden" name="client_ip" value="{{ u.client_ip }}">
-          <button class="btn btn-danger btn-sm" onclick="return confirm('Kick?')">Kick</button>
+          <button class="btn btn-danger btn-sm" onclick="return confirm('এই ডিভাইসটিকে ডিসকানেক্ট করতে চান?')">Kick</button>
         </form>
       </td>
     </tr>
     {% else %}
-    <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px">কোনো সেশন নেই।</td></tr>
+    <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px">বর্তমানে কোনো সেশন নেই।</td></tr>
     {% endfor %}
     </tbody>
   </table></div>
@@ -858,17 +914,17 @@ DASH_CONTENT = """
 ORDERS_CONTENT = """
 <div class="card">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:13px;flex-wrap:wrap;gap:8px">
-    <h3>💳 পেমেন্ট অর্ডার ম্যানেজমেন্ট</h3>
+    <h3>💳 পেমেন্ট অর্ডারসমূহ</h3>
     <div style="display:flex;gap:8px">
       <a href="?status=pending" class="btn btn-warning btn-sm">পেন্ডিং</a>
       <a href="?status=verified" class="btn btn-success btn-sm">অনুমোদিত</a>
       <a href="?status=rejected" class="btn btn-danger btn-sm">প্রত্যাখ্যাত</a>
-      <a href="?" class="btn btn-secondary btn-sm">সব</a>
+      <a href="?" class="btn btn-secondary btn-sm">সব অর্ডার</a>
     </div>
   </div>
   <div class="table-responsive"><table>
-    <thead><tr><th>অর্ডার ID</th><th>নাম/IP</th><th>প্যাকেজ</th><th>পরিমাণ</th>
-      <th>পেমেন্ট</th><th>TxnID</th><th>স্ট্যাটাস</th><th>সময়</th><th>Action</th></tr></thead>
+    <thead><tr><th>অর্ডার ID</th><th>নাম / IP</th><th>প্যাকেজ</th><th>টাকা</th>
+      <th>পেমেন্ট</th><th>TxnID</th><th>স্ট্যাটাস</th><th>সময়</th><th>Action</th></tr></thead>
     <tbody>
     {% for o in orders %}
     <tr>
@@ -877,8 +933,7 @@ ORDERS_CONTENT = """
       <td style="font-size:.82rem">{{ o.pkg_name }}</td>
       <td>৳{{ "%.0f"|format(o.amount) }}</td>
       <td>
-        {% if o.payment_method=='bkash' %}🔴{% elif o.payment_method=='nagad' %}🟠{% endif %}
-        {{ o.payment_method }}
+        {% if o.payment_method=='bkash' %}🔴 বিকাশ{% elif o.payment_method=='nagad' %}🟠 নগদ{% else %}{{ o.payment_method }}{% endif %}
       </td>
       <td><code style="font-size:.78rem">{{ o.transaction_id }}</code></td>
       <td>
@@ -895,8 +950,7 @@ ORDERS_CONTENT = """
           <button class="btn btn-success btn-sm">✓ অনুমোদন</button>
         </form>
         <form method="POST" action="{{ url_for('admin_reject_order', order_id=o.order_id) }}" style="display:inline">
-          <input type="hidden" name="notes" value="পেমেন্ট যাচাই করা যায়নি।">
-          <button class="btn btn-danger btn-sm" onclick="return confirm('প্রত্যাখ্যান করবেন?')">✗ প্রত্যাখ্যান</button>
+          <button class="btn btn-danger btn-sm" onclick="return confirm('প্রত্যাখ্যান করবেন?')">✗ বাতিল</button>
         </form>
         {% endif %}
       </td>
@@ -910,11 +964,11 @@ ORDERS_CONTENT = """
 
 PACKAGES_CONTENT = """
 <div class="card">
-  <h3>➕ নতুন প্যাকেজ যোগ করুন</h3>
+  <h3>➕ নতুন প্যাকেজ প্ল্যান যোগ করুন</h3>
   <form method="POST" action="{{ url_for('admin_add_package') }}"
         style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
     <div style="flex:2;min-width:160px">
-      <label>প্যাকেজ নাম</label>
+      <label>প্যাকেজের নাম</label>
       <input name="name" class="form-control" placeholder="যেমন: ১ টাকা - ১০ মিনিট" required>
     </div>
     <div style="flex:1;min-width:100px">
@@ -922,20 +976,20 @@ PACKAGES_CONTENT = """
       <input name="price" type="number" step="0.01" class="form-control" placeholder="1.00" required>
     </div>
     <div style="flex:1;min-width:100px">
-      <label>সময় (মিনিট)</label>
+      <label>মেয়াদ (মিনিট)</label>
       <input name="duration_minutes" type="number" class="form-control" placeholder="10" required>
     </div>
     <div style="flex:2;min-width:180px">
       <label>বিবরণ</label>
-      <input name="description" class="form-control" placeholder="সংক্ষিপ্ত বিবরণ">
+      <input name="description" class="form-control" placeholder="১০ মিনিটের হাই-স্পিড ইন্টারনেট">
     </div>
     <div><button type="submit" class="btn btn-success" style="height:44px;padding:0 18px">+ যোগ করুন</button></div>
   </form>
 </div>
 <div class="card">
-  <h3>📦 সব প্যাকেজ</h3>
+  <h3>📦 বিদ্যমান প্যাকেজসমূহ</h3>
   <div class="table-responsive"><table>
-    <thead><tr><th>নাম</th><th>মূল্য</th><th>সময়</th><th>বিবরণ</th><th>স্ট্যাটাস</th><th>Action</th></tr></thead>
+    <thead><tr><th>নাম</th><th>মূল্য</th><th>মেয়াদ</th><th>বিবরণ</th><th>স্ট্যাটাস</th><th>Action</th></tr></thead>
     <tbody>
     {% for p in packages %}
     <tr>
@@ -967,11 +1021,11 @@ PACKAGES_CONTENT = """
 
 PAYMENT_METHODS_CONTENT = """
 <div class="card">
-  <h3>➕ নতুন পেমেন্ট পদ্ধতি যোগ করুন</h3>
+  <h3>➕ নতুন পেমেন্ট নম্বর যোগ করুন</h3>
   <form method="POST" action="{{ url_for('admin_add_payment_method') }}"
         style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
     <div style="flex:1;min-width:130px">
-      <label>পেমেন্ট পদ্ধতি</label>
+      <label>মেথড</label>
       <select name="method" class="form-control">
         <option value="bkash">🔴 বিকাশ (bKash)</option>
         <option value="nagad">🟠 নগদ (Nagad)</option>
@@ -979,24 +1033,24 @@ PAYMENT_METHODS_CONTENT = """
       </select>
     </div>
     <div style="flex:1;min-width:160px">
-      <label>নম্বর</label>
+      <label>মোবাইল নম্বর</label>
       <input name="number" class="form-control" placeholder="01XXXXXXXXX" required>
     </div>
     <div style="flex:1;min-width:150px">
       <label>অ্যাকাউন্টের নাম</label>
-      <input name="account_name" class="form-control" placeholder="আপনার নাম">
+      <input name="account_name" class="form-control" placeholder="অ্যাডমিন">
     </div>
     <div><button type="submit" class="btn btn-success" style="height:44px;padding:0 18px">+ যোগ করুন</button></div>
   </form>
 </div>
 <div class="card">
-  <h3>💰 সব পেমেন্ট পদ্ধতি</h3>
+  <h3>💰 পেমেন্ট নম্বর তালিকা</h3>
   <div class="alert alert-info">
     ⚙️ <strong>অটো-অ্যাপ্রুভ:</strong>
     {% if auto_approve=='1' %}
-      <span class="badge badge-success">চালু আছে</span> — ট্রানজেকশন ID দিলেই স্বয়ংক্রিয় অনুমোদন হবে।
+      <span class="badge badge-success">চালু আছে</span> — ট্রানজেকশন ID সাবমিট করলেই সিস্টেম স্বয়ংক্রিয়ভাবে ভাউচার পিন দিয়ে দিবে।
     {% else %}
-      <span class="badge badge-secondary">বন্ধ আছে</span> — ম্যানুয়ালি অর্ডার অনুমোদন করতে হবে।
+      <span class="badge badge-secondary">বন্ধ আছে</span> — অ্যাডমিনকে ম্যানুয়ালি অর্ডার অনুমোদন করতে হবে।
     {% endif %}
     <form method="POST" action="{{ url_for('admin_toggle_auto_approve') }}" style="display:inline;margin-left:10px">
       <button class="btn btn-warning btn-sm">
@@ -1005,7 +1059,7 @@ PAYMENT_METHODS_CONTENT = """
     </form>
   </div>
   <div class="table-responsive"><table>
-    <thead><tr><th>পদ্ধতি</th><th>নম্বর</th><th>নাম</th><th>স্ট্যাটাস</th><th>Action</th></tr></thead>
+    <thead><tr><th>মেথড</th><th>নম্বর</th><th>নাম</th><th>স্ট্যাটাস</th><th>Action</th></tr></thead>
     <tbody>
     {% for m in methods %}
     <tr>
@@ -1026,7 +1080,7 @@ PAYMENT_METHODS_CONTENT = """
       </td>
     </tr>
     {% else %}
-    <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px">কোনো পেমেন্ট পদ্ধতি নেই।</td></tr>
+    <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px">কোনো পেমেন্ট নম্বর নেই।</td></tr>
     {% endfor %}
     </tbody>
   </table></div>
@@ -1035,9 +1089,9 @@ PAYMENT_METHODS_CONTENT = """
 VOUCHER_CONTENT = """
 <div class="card">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:13px;flex-wrap:wrap;gap:8px">
-    <h3>🎟️ সব ভাউচার পিন</h3>
+    <h3>🎟️ তৈরি হওয়া সব ভাউচার পিন</h3>
     <form method="POST" action="{{ url_for('admin_clear_used_pins') }}" style="display:inline">
-      <button class="btn btn-danger btn-sm" onclick="return confirm('ব্যবহৃত পিন মুছবেন?')">🗑️ ব্যবহৃত পিন মুছুন</button>
+      <button class="btn btn-danger btn-sm" onclick="return confirm('সব ব্যবহৃত পিন মুছবেন?')">🗑️ ব্যবহৃত পিন মুছুন</button>
     </form>
   </div>
   <div class="table-responsive"><table>
@@ -1047,7 +1101,7 @@ VOUCHER_CONTENT = """
     <tr>
       <td style="font-size:1.05rem;font-weight:700;letter-spacing:3px">{{ p.pin }}</td>
       <td>{% if p.source=='payment' %}<span class="badge badge-info">পেমেন্ট</span>
-          {% else %}<span class="badge badge-secondary">ম্যানুয়াল</span>{% endif %}</td>
+          {% else %}<span class="badge badge-secondary">ম্যানুয়াল</span>{% endif %}</td>
       <td>{% if p.status=='active' %}<span class="badge badge-success">ACTIVE</span>
           {% else %}<span class="badge badge-secondary">USED</span>{% endif %}</td>
       <td style="font-size:.8rem">{{ p.created_at }}</td>
@@ -1123,31 +1177,31 @@ SITE_SETTINGS_CONTENT = """
       <input name="site_name" class="form-control" value="{{ s.site_name }}" required></div>
     <div class="form-group"><label>সাবটাইটেল</label>
       <input name="site_subtitle" class="form-control" value="{{ s.site_subtitle }}"></div>
-    <div class="form-group"><label>ওয়েলকাম টেক্সট</label>
+    <div class="form-group"><label>ওয়েলকাম টেক্সট</label>
       <input name="welcome_text" class="form-control" value="{{ s.welcome_text }}"></div>
     <div class="form-group"><label>ফুটার নোট</label>
       <input name="footer_text" class="form-control" value="{{ s.footer_text }}"></div>
     <div class="form-group"><label>প্রাইমারি রঙ</label>
       <input type="color" name="primary_color" class="form-control"
              value="{{ s.primary_color }}" style="height:46px;cursor:pointer"></div>
-    <div class="form-group"><label>গেটওয়ে IP</label>
+    <div class="form-group"><label>গেটওয়ে IP</label>
       <input name="gateway_ip" class="form-control" value="{{ s.gateway_ip }}">
-      <small style="color:var(--muted)">Termux: <code>ip addr show wlan0</code> দিয়ে বের করুন</small></div>
+      <small style="color:var(--muted)">Termux: <code>ip addr show</code> দিয়ে দেখে নিন</small></div>
     <button type="submit" class="btn btn-primary btn-block" style="padding:12px">💾 সেভ করুন</button>
   </form>
 </div>"""
 
 ADMIN_SETTINGS_CONTENT = """
 <div class="card" style="max-width:500px;margin:0 auto">
-  <h3>🔐 অ্যাডমিন ক্রেডেনশিয়াল পরিবর্তন</h3>
+  <h3>🔐 অ্যাডমিন ক্রেডেনশিয়াল পরিবর্তন</h3>
   <form method="POST">
-    <div class="form-group"><label>বর্তমান পাসওয়ার্ড</label>
+    <div class="form-group"><label>বর্তমান পাসওয়ার্ড</label>
       <input type="password" name="current_password" class="form-control" required></div>
     <div class="form-group"><label>নতুন ইউজারনেম</label>
       <input name="new_username" class="form-control" value="{{ admin.username }}" required></div>
-    <div class="form-group"><label>নতুন পাসওয়ার্ড</label>
+    <div class="form-group"><label>নতুন পাসওয়ার্ড</label>
       <input type="password" name="new_password" class="form-control" placeholder="কমপক্ষে ৪ অক্ষর" required></div>
-    <div class="form-group"><label>পাসওয়ার্ড নিশ্চিত করুন</label>
+    <div class="form-group"><label>পাসওয়ার্ড নিশ্চিত করুন</label>
       <input type="password" name="confirm_password" class="form-control" required></div>
     <button type="submit" class="btn btn-primary btn-block" style="padding:12px">আপডেট করুন</button>
   </form>
@@ -1155,46 +1209,33 @@ ADMIN_SETTINGS_CONTENT = """
 
 GUIDE_CONTENT = """
 <div class="card">
-  <h3>📱 Termux সেটআপ গাইড</h3>
-  <h4 style="margin:16px 0 7px">১. প্রথমবার ইনস্টল</h4>
-  <pre class="terminal">pkg update -y && pkg upgrade -y
-pkg install -y python git root-repo iptables dnsmasq tsu
-pip install -r requirements.txt</pre>
-  <h4 style="margin:16px 0 7px">২. হটস্পট চালু করে IP বের করুন</h4>
-  <pre class="terminal">ip addr show wlan0 | grep inet</pre>
-  <h4 style="margin:16px 0 7px">৩. Root শেল + iptables (একবারই)</h4>
-  <pre class="terminal">tsu
-echo 1 > /proc/sys/net/ipv4/ip_forward
-iptables -t nat -F
-iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport 80  -j REDIRECT --to-port 8080
-iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport 443 -j REDIRECT --to-port 8080
-iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 53  -j REDIRECT --to-port 5353</pre>
-  <h4 style="margin:16px 0 7px">৪. DNS Spoofing (নতুন সেশনে)</h4>
-  <pre class="terminal">dnsmasq -k -a {{ s.gateway_ip }} --address=/#/{{ s.gateway_ip }} -p 5353 --no-resolv --no-poll &</pre>
-  <h4 style="margin:16px 0 7px">৫. সার্ভার চালু (নতুন সেশনে)</h4>
-  <pre class="terminal">python app.py</pre>
-  <div class="alert alert-info" style="margin-top:14px">
-    💡 কানেক্টেড ডিভাইস → OS captive portal check → Flask redirect → পোর্টাল পপআপ → প্যাকেজ নির্বাচন → পেমেন্ট → ভাউচার কোড → ইন্টারনেট ✅
-  </div>
-  <div class="alert alert-warning">
-    ⚠️ iptables ছাড়া ম্যানুয়ালি <strong>http://{{ s.gateway_ip }}:8080</strong> দিয়ে এক্সেস করতে হবে।
-  </div>
+  <h3>📱 Termux সেটআপ ও কমান্ড গাইড</h3>
+  <h4 style="margin:16px 0 7px">১. প্রজেক্ট আপডেট বা নতুন করে নামানো</h4>
+  <pre class="terminal">cd ~/MikroTik-Style-Captive-Portal-WiFi-Hotspot-Management-System
+git pull origin main</pre>
+  <h4 style="margin:16px 0 7px">২. সম্পূর্ণ ক্যাপটিভ পোর্টাল ইঞ্জিন রান করা</h4>
+  <pre class="terminal">bash portal_engine.sh</pre>
+  <h4 style="margin:16px 0 7px">৩. ঐচ্ছিক: পুরনো ফাইল বা ফোল্ডার ডিলিট করতে চাইলে</h4>
+  <pre class="terminal"># পুরো ফোল্ডার মুছে ফেলতে:
+rm -rf ~/MikroTik-Style-Captive-Portal-WiFi-Hotspot-Management-System
+
+# শুধু ডাটাবেস রিসেট করতে:
+rm -f ~/MikroTik-Style-Captive-Portal-WiFi-Hotspot-Management-System/hotspot.db</pre>
 </div>"""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Captive Portal Detection (all OS/browser checks)
+# ══  CAPTIVE PORTAL DETECTION & MIDDLEWARE  ══
 # ─────────────────────────────────────────────────────────────────────────────
-BYPASS = {"/", "/login", "/status", "/user-logout", "/order",
-          "/voucher", "/contact",
-          "/generate_204", "/gen_204", "/hotspot-detect.html",
-          "/ncsi.txt", "/canonical.html", "/connecttest.txt", "/favicon.ico"}
+BYPASS_ROUTES = {"/", "/login", "/status", "/user-logout", "/order",
+                 "/contact", "/generate_204", "/gen_204", "/hotspot-detect.html",
+                 "/ncsi.txt", "/canonical.html", "/connecttest.txt", "/favicon.ico"}
 
 @app.before_request
-def captive_redirect():
+def captive_middleware():
     p = request.path
     if p.startswith("/admin") or p.startswith("/static") or p.startswith("/order/"):
         return None
-    if p in BYPASS:
+    if p in BYPASS_ROUTES:
         return None
     ip = client_ip()
     if not is_authenticated(ip):
@@ -1223,7 +1264,6 @@ def portal_index():
     ip = client_ip()
     if is_authenticated(ip):
         return redirect(url_for("portal_status"))
-    # Check pending/verified order
     conn = get_db()
     order = conn.execute(
         "SELECT * FROM payment_orders WHERE client_ip=? AND status IN ('pending','verified') ORDER BY id DESC LIMIT 1",
@@ -1232,8 +1272,9 @@ def portal_index():
     conn.close()
     if order:
         return redirect(url_for("order_status", order_id=order["order_id"]))
-    s = get_settings(); css = base_css(s.get("primary_color","#007bff"))
-    return render_template_string(PACKAGES_TMPL, s=s, css=css, ip=ip, packages=pkgs)
+    s = get_settings()
+    css = base_css(s.get("primary_color", "#007bff"))
+    return render_template_string(PORTAL_MAIN_TMPL, s=s, css=css, ip=ip, packages=pkgs)
 
 @app.route("/order/<pkg_id>")
 def order_page(pkg_id):
@@ -1244,16 +1285,16 @@ def order_page(pkg_id):
     methods = conn.execute("SELECT * FROM payment_methods WHERE is_active=1").fetchall()
     conn.close()
     if not pkg: return redirect(url_for("portal_index"))
-    s = get_settings(); css = base_css(s.get("primary_color","#007bff"))
+    s = get_settings(); css = base_css(s.get("primary_color", "#007bff"))
     return render_template_string(PAYMENT_TMPL, s=s, css=css, pkg=pkg, methods=methods, ip=ip)
 
 @app.route("/order", methods=["POST"])
 def submit_order():
     ip = client_ip()
-    pkg_id         = request.form.get("package_id","")
-    client_name    = request.form.get("client_name","").strip()
-    payment_method = request.form.get("payment_method","").strip()
-    txn_id         = request.form.get("transaction_id","").strip()
+    pkg_id         = request.form.get("package_id", "")
+    client_name    = request.form.get("client_name", "").strip()
+    payment_method = request.form.get("payment_method", "").strip()
+    txn_id         = request.form.get("transaction_id", "").strip()
 
     if not all([pkg_id, payment_method, txn_id]):
         flash("সব তথ্য পূরণ করুন!", "danger")
@@ -1264,14 +1305,14 @@ def submit_order():
     if not pkg:
         conn.close(); return redirect(url_for("portal_index"))
 
-    # Duplicate txn check
+    # Duplicate Txn Check
     if conn.execute("SELECT id FROM payment_orders WHERE transaction_id=?", (txn_id,)).fetchone():
         conn.close()
-        flash("⚠️ এই ট্রানজেকশন আইডি আগেই ব্যবহৃত হয়েছে!", "warning")
+        flash("⚠️ এই ট্রানজেকশন আইডি আগেই ব্যবহৃত হয়েছে!", "warning")
         return redirect(url_for("order_page", pkg_id=pkg_id))
 
     order_id = gen_order_id()
-    auto = get_settings().get("auto_approve","0") == "1"
+    auto = get_settings().get("auto_approve", "1") == "1"
     vpin = None; v_at = None; status = "pending"
 
     if auto:
@@ -1283,7 +1324,8 @@ def submit_order():
         (order_id,client_ip,client_name,package_id,amount,payment_method,transaction_id,status,voucher_pin,verified_at)
         VALUES(?,?,?,?,?,?,?,?,?,?)""",
         (order_id, ip, client_name, pkg["id"], pkg["price"], payment_method, txn_id, status, vpin, v_at))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     return redirect(url_for("order_status", order_id=order_id))
 
 @app.route("/order/status/<order_id>")
@@ -1296,38 +1338,36 @@ def order_status(order_id):
         "JOIN packages p ON o.package_id=p.id WHERE o.order_id=?", (order_id,)).fetchone()
     conn.close()
     if not order:
-        flash("অর্ডার পাওয়া যায়নি।","danger")
+        flash("অর্ডার পাওয়া যায়নি।", "danger")
         return redirect(url_for("portal_index"))
-    s = get_settings(); css = base_css(s.get("primary_color","#007bff"))
+    s = get_settings(); css = base_css(s.get("primary_color", "#007bff"))
     return render_template_string(ORDER_STATUS_TMPL, s=s, css=css, order=order, ip=ip)
-
-@app.route("/voucher")
-def voucher_page():
-    ip = client_ip()
-    if is_authenticated(ip): return redirect(url_for("portal_status"))
-    s = get_settings(); css = base_css(s.get("primary_color","#007bff"))
-    return render_template_string(VOUCHER_PAGE_TMPL, s=s, css=css, ip=ip)
 
 @app.route("/login", methods=["POST"])
 def login():
     ip  = client_ip()
-    pin = request.form.get("pin","").strip()
-    if not pin or len(pin)!=4 or not pin.isdigit():
-        flash("❌ সঠিক ৪-ডিজিট কোড দিন!","danger")
-        return redirect(url_for("voucher_page"))
+    pin = request.form.get("pin", "").strip()
+    if not pin or len(pin) != 4 or not pin.isdigit():
+        flash("❌ সঠিক ৪-ডিজিটের পিন দিন!", "danger")
+        return redirect(url_for("portal_index"))
 
     conn    = get_db()
     voucher = conn.execute("SELECT * FROM vouchers WHERE pin=?", (pin,)).fetchone()
     if not voucher:
-        conn.close(); flash("❌ কোডটি বৈধ নয়!","danger")
-        return redirect(url_for("voucher_page"))
+        conn.close()
+        flash("❌ পিনটি বৈধ নয়!", "danger")
+        return redirect(url_for("portal_index"))
     if voucher["status"] != "active":
-        conn.close(); flash("⚠️ এই কোডটি আগেই ব্যবহৃত হয়েছে!","warning")
-        return redirect(url_for("voucher_page"))
+        conn.close()
+        flash("⚠️ এই পিনটি আগেই ব্যবহৃত হয়েছে!", "warning")
+        return redirect(url_for("portal_index"))
 
-    # Get duration from order/package
-    now = datetime.now(); now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    expires_at = None; pkg_id = None
+    # Calculate expiration time from package
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = None
+    pkg_id = None
+
     if voucher["order_id"]:
         o = conn.execute(
             "SELECT o.package_id,p.duration_minutes FROM payment_orders o "
@@ -1337,13 +1377,21 @@ def login():
             pkg_id = o["package_id"]
             expires_at = (now + timedelta(minutes=o["duration_minutes"])).strftime("%Y-%m-%d %H:%M:%S")
 
+    # If voucher was manually generated without an order, set default 60 minutes
+    if not expires_at:
+        expires_at = (now + timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M:%S")
+
     conn.execute("UPDATE vouchers SET status='used',used_at=?,used_by_ip=? WHERE id=?",
                  (now_str, ip, voucher["id"]))
     conn.execute("INSERT OR REPLACE INTO active_sessions(client_ip,pin,package_id,login_time,expires_at,user_agent) VALUES(?,?,?,?,?,?)",
-                 (ip, pin, pkg_id, now_str, expires_at, request.headers.get("User-Agent","")))
-    conn.commit(); conn.close()
-    _allow(ip)
-    flash("✅ ইন্টারনেট চালু হয়েছে!","success")
+                 (ip, pin, pkg_id, now_str, expires_at, request.headers.get("User-Agent", "")))
+    conn.commit()
+    conn.close()
+
+    # Unlock Internet in Firewall
+    _allow_internet_ip(ip)
+
+    flash("✅ ইন্টারনেট সংযোগ সক্রিয় হয়েছে!", "success")
     return redirect(url_for("portal_status"))
 
 @app.route("/status")
@@ -1355,7 +1403,7 @@ def portal_status():
         "LEFT JOIN packages p ON s.package_id=p.id WHERE s.client_ip=?", (ip,)).fetchone()
     conn.close()
     if not sess: return redirect(url_for("portal_index"))
-    s = get_settings(); css = base_css(s.get("primary_color","#007bff"))
+    s = get_settings(); css = base_css(s.get("primary_color", "#007bff"))
     return render_template_string(STATUS_TMPL, s=s, css=css, sess=sess)
 
 @app.route("/user-logout", methods=["POST"])
@@ -1363,24 +1411,25 @@ def user_logout():
     ip = client_ip()
     conn = get_db()
     conn.execute("DELETE FROM active_sessions WHERE client_ip=?", (ip,))
-    conn.commit(); conn.close()
-    _revoke(ip)
-    flash("ডিসকানেক্ট হয়েছেন।","info")
+    conn.commit()
+    conn.close()
+    _revoke_internet_ip(ip)
+    flash("সফলভাবে ডিসকানেক্ট হয়েছেন।", "info")
     return redirect(url_for("portal_index"))
 
-@app.route("/contact", methods=["GET","POST"])
+@app.route("/contact", methods=["GET", "POST"])
 def contact_page():
     ip = client_ip()
-    s  = get_settings(); css = base_css(s.get("primary_color","#007bff"))
+    s  = get_settings(); css = base_css(s.get("primary_color", "#007bff"))
     conn = get_db()
     if request.method == "POST":
-        name = request.form.get("sender_name","ইউজার").strip()
-        msg  = request.form.get("message","").strip()
+        name = request.form.get("sender_name", "ইউজার").strip()
+        msg  = request.form.get("message", "").strip()
         if msg:
             conn.execute("INSERT INTO messages(client_ip,sender_name,message) VALUES(?,?,?)",
                          (ip, name, msg))
             conn.commit()
-            flash("✅ আপনার বার্তা পাঠানো হয়েছে! অ্যাডমিন শীঘ্রই উত্তর দেবেন।","success")
+            flash("✅ আপনার বার্তা পাঠানো হয়েছে! অ্যাডমিন শীঘ্রই উত্তর দিবেন।", "success")
     prev = conn.execute("SELECT * FROM messages WHERE client_ip=? ORDER BY id DESC LIMIT 10", (ip,)).fetchall()
     conn.close()
     return render_template_string(CONTACT_TMPL, s=s, css=css, prev_msgs=prev)
@@ -1388,13 +1437,13 @@ def contact_page():
 # ─────────────────────────────────────────────────────────────────────────────
 # ══  ADMIN ROUTES  ══
 # ─────────────────────────────────────────────────────────────────────────────
-@app.route("/admin/login", methods=["GET","POST"])
+@app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     if session.get("admin_logged_in"): return redirect(url_for("admin_dashboard"))
-    s = get_settings(); css = base_css(s.get("primary_color","#007bff"))
+    s = get_settings(); css = base_css(s.get("primary_color", "#007bff"))
     if request.method == "POST":
-        u = request.form.get("username","").strip()
-        p = request.form.get("password","").strip()
+        u = request.form.get("username", "").strip()
+        p = request.form.get("password", "").strip()
         conn = get_db()
         user = conn.execute("SELECT * FROM admin_users WHERE username=?", (u,)).fetchone()
         conn.close()
@@ -1402,25 +1451,25 @@ def admin_login():
             session["admin_logged_in"] = True
             session["admin_username"]  = user["username"]
             session.permanent = True
-            flash(f"স্বাগতম {user['username']}!","success")
+            flash(f"স্বাগতম {user['username']}!", "success")
             return redirect(url_for("admin_dashboard"))
-        flash("❌ ভুল ইউজারনেম বা পাসওয়ার্ড!","danger")
+        flash("❌ ভুল ইউজারনেম বা পাসওয়ার্ড!", "danger")
     return render_template_string(ADMIN_LOGIN_TMPL, css=css)
 
 @app.route("/admin/logout")
 def admin_logout():
     session.clear()
-    flash("লগআউট হয়েছেন।","info")
+    flash("লগআউট হয়েছেন।", "info")
     return redirect(url_for("admin_login"))
 
 @app.route("/admin")
 @admin_required
 def admin_dashboard():
     conn = get_db()
-    total_pins    = conn.execute("SELECT COUNT(*) FROM vouchers").fetchone()[0]
-    active_pins   = conn.execute("SELECT COUNT(*) FROM vouchers WHERE status='active'").fetchone()[0]
-    pending_orders= conn.execute("SELECT COUNT(*) FROM payment_orders WHERE status='pending'").fetchone()[0]
-    total_orders  = conn.execute("SELECT COUNT(*) FROM payment_orders").fetchone()[0]
+    total_pins     = conn.execute("SELECT COUNT(*) FROM vouchers").fetchone()[0]
+    active_pins    = conn.execute("SELECT COUNT(*) FROM vouchers WHERE status='active'").fetchone()[0]
+    pending_orders = conn.execute("SELECT COUNT(*) FROM payment_orders WHERE status='pending'").fetchone()[0]
+    total_orders   = conn.execute("SELECT COUNT(*) FROM payment_orders WHERE status='verified'").fetchone()[0]
     sessions = conn.execute(
         "SELECT s.*,p.name as pkg_name FROM active_sessions s LEFT JOIN packages p ON s.package_id=p.id "
         "ORDER BY s.login_time DESC").fetchall()
@@ -1434,7 +1483,7 @@ def admin_dashboard():
 @app.route("/admin/orders")
 @admin_required
 def admin_orders():
-    flt = request.args.get("status","")
+    flt = request.args.get("status", "")
     conn = get_db()
     q = "SELECT o.*,p.name as pkg_name FROM payment_orders o JOIN packages p ON o.package_id=p.id"
     q += (" WHERE o.status=?" if flt else "") + " ORDER BY o.id DESC"
@@ -1454,18 +1503,18 @@ def admin_approve_order(order_id):
         conn.execute("UPDATE payment_orders SET status='verified',voucher_pin=?,verified_at=? WHERE order_id=?",
                      (pin, now, order_id))
         conn.commit()
-        flash(f"✅ অর্ডার {order_id} অনুমোদিত। পিন: {pin}","success")
+        flash(f"✅ অর্ডার {order_id} অনুমোদিত হয়েছে। পিন: {pin}", "success")
     conn.close()
     return redirect(url_for("admin_orders"))
 
 @app.route("/admin/orders/<order_id>/reject", methods=["POST"])
 @admin_required
 def admin_reject_order(order_id):
-    notes = request.form.get("notes","পেমেন্ট যাচাই করা যায়নি।")
+    notes = request.form.get("notes", "পেমেন্ট যাচাই করা যায়নি।")
     conn  = get_db()
     conn.execute("UPDATE payment_orders SET status='rejected',notes=? WHERE order_id=?", (notes, order_id))
     conn.commit(); conn.close()
-    flash(f"অর্ডার {order_id} প্রত্যাখ্যাত করা হয়েছে।","warning")
+    flash(f"অর্ডার {order_id} বাতিল করা হয়েছে।", "warning")
     return redirect(url_for("admin_orders"))
 
 @app.route("/admin/packages")
@@ -1480,15 +1529,15 @@ def admin_packages():
 @app.route("/admin/packages/add", methods=["POST"])
 @admin_required
 def admin_add_package():
-    name     = request.form.get("name","").strip()
+    name     = request.form.get("name", "").strip()
     price    = float(request.form.get("price", 0))
     dur      = int(request.form.get("duration_minutes", 10))
-    desc     = request.form.get("description","").strip()
+    desc     = request.form.get("description", "").strip()
     conn = get_db()
     conn.execute("INSERT INTO packages(name,price,duration_minutes,description) VALUES(?,?,?,?)",
                  (name, price, dur, desc))
     conn.commit(); conn.close()
-    flash(f"✅ প্যাকেজ '{name}' যোগ করা হয়েছে!","success")
+    flash(f"✅ প্যাকেজ '{name}' যোগ করা হয়েছে!", "success")
     return redirect(url_for("admin_packages"))
 
 @app.route("/admin/packages/<int:pkg_id>/delete", methods=["POST"])
@@ -1497,7 +1546,7 @@ def admin_delete_package(pkg_id):
     conn = get_db()
     conn.execute("DELETE FROM packages WHERE id=?", (pkg_id,))
     conn.commit(); conn.close()
-    flash("প্যাকেজ ডিলিট হয়েছে।","info")
+    flash("প্যাকেজ ডিলিট হয়েছে।", "info")
     return redirect(url_for("admin_packages"))
 
 @app.route("/admin/packages/<int:pkg_id>/toggle", methods=["POST"])
@@ -1506,7 +1555,7 @@ def admin_toggle_package(pkg_id):
     conn = get_db()
     conn.execute("UPDATE packages SET is_active = 1 - is_active WHERE id=?", (pkg_id,))
     conn.commit(); conn.close()
-    flash("প্যাকেজ স্ট্যাটাস আপডেট হয়েছে।","info")
+    flash("প্যাকেজ স্ট্যাটাস পরিবর্তন হয়েছে।", "info")
     return redirect(url_for("admin_packages"))
 
 @app.route("/admin/payment-methods")
@@ -1516,20 +1565,20 @@ def admin_payment_methods():
     methods = conn.execute("SELECT * FROM payment_methods ORDER BY id").fetchall()
     conn.close()
     s = get_settings()
-    auto = s.get("auto_approve","0")
+    auto = s.get("auto_approve", "1")
     html = render_template_string(PAYMENT_METHODS_CONTENT, methods=methods, auto_approve=auto, url_for=url_for)
     return render_admin("পেমেন্ট পদ্ধতি", "pay", html)
 
 @app.route("/admin/payment-methods/add", methods=["POST"])
 @admin_required
 def admin_add_payment_method():
-    method = request.form.get("method","").strip()
-    number = request.form.get("number","").strip()
-    name   = request.form.get("account_name","").strip()
+    method = request.form.get("method", "").strip()
+    number = request.form.get("number", "").strip()
+    name   = request.form.get("account_name", "").strip()
     conn   = get_db()
     conn.execute("INSERT INTO payment_methods(method,number,account_name) VALUES(?,?,?)", (method, number, name))
     conn.commit(); conn.close()
-    flash("✅ পেমেন্ট পদ্ধতি যোগ হয়েছে!","success")
+    flash("✅ পেমেন্ট পদ্ধতি যোগ হয়েছে!", "success")
     return redirect(url_for("admin_payment_methods"))
 
 @app.route("/admin/payment-methods/<int:mid>/delete", methods=["POST"])
@@ -1538,7 +1587,7 @@ def admin_delete_payment_method(mid):
     conn = get_db()
     conn.execute("DELETE FROM payment_methods WHERE id=?", (mid,))
     conn.commit(); conn.close()
-    flash("পেমেন্ট পদ্ধতি ডিলিট হয়েছে।","info")
+    flash("পেমেন্ট পদ্ধতি ডিলিট হয়েছে।", "info")
     return redirect(url_for("admin_payment_methods"))
 
 @app.route("/admin/payment-methods/toggle-auto", methods=["POST"])
@@ -1549,44 +1598,44 @@ def admin_toggle_auto_approve():
     new = "0" if (cur and cur["value"]=="1") else "1"
     conn.execute("INSERT OR REPLACE INTO site_settings(key,value) VALUES('auto_approve',?)", (new,))
     conn.commit(); conn.close()
-    flash(f"অটো-অ্যাপ্রুভ {'চালু' if new=='1' else 'বন্ধ'} করা হয়েছে।","info")
+    flash(f"অটো-অ্যাপ্রুভ {'চালু' if new=='1' else 'বন্ধ'} করা হয়েছে।", "info")
     return redirect(url_for("admin_payment_methods"))
 
 @app.route("/admin/vouchers")
 @admin_required
 def admin_vouchers():
     conn = get_db()
-    pins       = conn.execute("SELECT * FROM vouchers ORDER BY id DESC").fetchall()
-    active_pins= conn.execute("SELECT * FROM vouchers WHERE status='active' ORDER BY id DESC").fetchall()
+    pins        = conn.execute("SELECT * FROM vouchers ORDER BY id DESC").fetchall()
+    active_pins = conn.execute("SELECT * FROM vouchers WHERE status='active' ORDER BY id DESC").fetchall()
     conn.close()
     html = render_template_string(VOUCHER_CONTENT, pins=pins, active_pins=active_pins, url_for=url_for)
-    return render_admin("ভাউচার পিন","vchr", html)
+    return render_admin("ভাউচার পিন", "vchr", html)
 
 @app.route("/admin/generate-pin", methods=["POST"])
 @admin_required
 def admin_generate_pin():
-    custom = request.form.get("custom_pin","").strip()
-    count  = int(request.form.get("count",1))
+    custom = request.form.get("custom_pin", "").strip()
+    count  = int(request.form.get("count", 1))
     conn   = get_db(); ok = 0
     if custom:
-        if len(custom)!=4 or not custom.isdigit():
-            flash("❌ কাস্টম পিন ৪ সংখ্যার হতে হবে!","danger")
+        if len(custom) != 4 or not custom.isdigit():
+            flash("❌ কাস্টম পিন অবশ্যই ৪ সংখ্যার হতে হবে!", "danger")
         else:
             try:
-                conn.execute("INSERT INTO vouchers(pin,source) VALUES(?,?)",(custom,"manual"))
-                conn.commit(); flash(f"✅ পিন {custom} তৈরি হয়েছে!","success")
+                conn.execute("INSERT INTO vouchers(pin,source) VALUES(?,?)", (custom, "manual"))
+                conn.commit(); flash(f"✅ পিন {custom} তৈরি হয়েছে!", "success")
             except sqlite3.IntegrityError:
-                flash(f"⚠️ পিন {custom} ইতোমধ্যে আছে!","warning")
+                flash(f"⚠️ পিন {custom} ইতোমধ্যে বিদ্যমান!", "warning")
     else:
         for _ in range(count):
             for __ in range(100):
-                p = str(random.randint(1000,9999))
+                p = str(random.randint(1000, 9999))
                 try:
-                    conn.execute("INSERT INTO vouchers(pin,source) VALUES(?,?)",(p,"manual"))
-                    conn.commit(); ok+=1; break
+                    conn.execute("INSERT INTO vouchers(pin,source) VALUES(?,?)", (p, "manual"))
+                    conn.commit(); ok += 1; break
                 except sqlite3.IntegrityError:
                     continue
-        flash(f"✅ {ok}টি পিন তৈরি হয়েছে!","success")
+        flash(f"✅ মোট {ok}টি নতুন ৪-ডিজিট পিন তৈরি হয়েছে!", "success")
     conn.close()
     return redirect(url_for("admin_dashboard"))
 
@@ -1596,7 +1645,7 @@ def admin_delete_pin(pin_id):
     conn = get_db()
     conn.execute("DELETE FROM vouchers WHERE id=?", (pin_id,))
     conn.commit(); conn.close()
-    flash("পিন ডিলিট হয়েছে।","info")
+    flash("পিন ডিলিট হয়েছে।", "info")
     return redirect(url_for("admin_vouchers"))
 
 @app.route("/admin/clear-used", methods=["POST"])
@@ -1605,19 +1654,19 @@ def admin_clear_used_pins():
     conn = get_db()
     n = conn.execute("DELETE FROM vouchers WHERE status='used'").rowcount
     conn.commit(); conn.close()
-    flash(f"🗑️ {n}টি ব্যবহৃত পিন মুছে ফেলা হয়েছে।","info")
+    flash(f"🗑️ মোট {n}টি ব্যবহৃত পিন মুছে ফেলা হয়েছে।", "info")
     return redirect(url_for("admin_vouchers"))
 
 @app.route("/admin/kick-user", methods=["POST"])
 @admin_required
 def admin_kick_user():
-    ip = request.form.get("client_ip","")
+    ip = request.form.get("client_ip", "")
     if ip:
         conn = get_db()
         conn.execute("DELETE FROM active_sessions WHERE client_ip=?", (ip,))
         conn.commit(); conn.close()
-        _revoke(ip)
-        flash(f"🚫 {ip} ডিসকানেক্ট করা হয়েছে।","warning")
+        _revoke_internet_ip(ip)
+        flash(f"🚫 ডিভাইস ({ip}) ডিসকানেক্ট করা হয়েছে।", "warning")
     return redirect(url_for("admin_dashboard"))
 
 @app.route("/admin/messages")
@@ -1627,17 +1676,17 @@ def admin_messages():
     msgs = conn.execute("SELECT * FROM messages ORDER BY id DESC").fetchall()
     conn.close()
     html = render_template_string(MESSAGES_CONTENT, messages=msgs, url_for=url_for)
-    return render_admin("ইউজার বার্তা","msg", html)
+    return render_admin("ইউজার বার্তা", "msg", html)
 
 @app.route("/admin/messages/<int:msg_id>/reply", methods=["POST"])
 @admin_required
 def admin_reply_message(msg_id):
-    reply = request.form.get("reply","").strip()
+    reply = request.form.get("reply", "").strip()
     now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn  = get_db()
     conn.execute("UPDATE messages SET reply=?,replied_at=?,is_read=1 WHERE id=?", (reply, now, msg_id))
     conn.commit(); conn.close()
-    flash("উত্তর পাঠানো হয়েছে।","success")
+    flash("উত্তর পাঠানো হয়েছে।", "success")
     return redirect(url_for("admin_messages"))
 
 @app.route("/admin/messages/mark-read", methods=["POST"])
@@ -1646,91 +1695,87 @@ def admin_mark_messages_read():
     conn = get_db()
     conn.execute("UPDATE messages SET is_read=1")
     conn.commit(); conn.close()
-    flash("সব বার্তা পঠিত চিহ্নিত করা হয়েছে।","info")
+    flash("সব বার্তা পঠিত চিহ্নিত করা হয়েছে।", "info")
     return redirect(url_for("admin_messages"))
 
-@app.route("/admin/site-settings", methods=["GET","POST"])
+@app.route("/admin/site-settings", methods=["GET", "POST"])
 @admin_required
 def admin_site_settings():
     if request.method == "POST":
         conn = get_db()
         for k in ["site_name","site_subtitle","welcome_text","footer_text",
                   "hotspot_name","primary_color","gateway_ip"]:
-            v = request.form.get(k,"").strip()
+            v = request.form.get(k, "").strip()
             if v:
-                conn.execute("INSERT OR REPLACE INTO site_settings(key,value) VALUES(?,?)", (k,v))
+                conn.execute("INSERT OR REPLACE INTO site_settings(key,value) VALUES(?,?)", (k, v))
         conn.commit(); conn.close()
-        flash("✅ সেটিংস সেভ হয়েছে!","success")
+        flash("✅ সাইট সেটিংস সেভ হয়েছে!", "success")
         return redirect(url_for("admin_site_settings"))
     s    = get_settings()
     html = render_template_string(SITE_SETTINGS_CONTENT, s=s, url_for=url_for)
-    return render_admin("সাইট সেটিংস","site", html)
+    return render_admin("সাইট সেটিংস", "site", html)
 
-@app.route("/admin/settings", methods=["GET","POST"])
+@app.route("/admin/settings", methods=["GET", "POST"])
 @admin_required
 def admin_settings():
     conn  = get_db()
     admin = conn.execute("SELECT * FROM admin_users WHERE username=?",
                          (session["admin_username"],)).fetchone()
     if request.method == "POST":
-        cur = request.form.get("current_password","")
-        nu  = request.form.get("new_username","").strip()
-        np_ = request.form.get("new_password","")
-        cnf = request.form.get("confirm_password","")
+        cur = request.form.get("current_password", "")
+        nu  = request.form.get("new_username", "").strip()
+        np_ = request.form.get("new_password", "")
+        cnf = request.form.get("confirm_password", "")
         if not check_password_hash(admin["password_hash"], cur):
-            flash("❌ বর্তমান পাসওয়ার্ড ভুল!","danger")
+            flash("❌ বর্তমান পাসওয়ার্ড ভুল!", "danger")
         elif len(np_) < 4:
-            flash("❌ পাসওয়ার্ড কমপক্ষে ৪ অক্ষরের হতে হবে!","danger")
+            flash("❌ নতুন পাসওয়ার্ড কমপক্ষে ৪ অক্ষরের হতে হবে!", "danger")
         elif np_ != cnf:
-            flash("❌ পাসওয়ার্ড মিলছে না!","danger")
+            flash("❌ পাসওয়ার্ড মিলছে না!", "danger")
         elif not nu:
-            flash("❌ ইউজারনেম খালি রাখা যাবে না!","danger")
+            flash("❌ ইউজারনেম খালি রাখা যাবে না!", "danger")
         else:
             conn.execute("UPDATE admin_users SET username=?,password_hash=? WHERE id=?",
                          (nu, generate_password_hash(np_), admin["id"]))
             conn.commit(); session["admin_username"] = nu
-            flash("✅ আপডেট হয়েছে!","success")
+            flash("✅ ইউজারনেম ও পাসওয়ার্ড সফলভাবে আপডেট হয়েছে!", "success")
             conn.close()
             return redirect(url_for("admin_dashboard"))
     conn.close()
     html = render_template_string(ADMIN_SETTINGS_CONTENT, admin=admin, url_for=url_for)
-    return render_admin("অ্যাডমিন সেটিং","cfg", html)
+    return render_admin("অ্যাডমিন সেটিং", "cfg", html)
 
 @app.route("/admin/guide")
 @admin_required
 def admin_guide():
     s    = get_settings()
     html = render_template_string(GUIDE_CONTENT, s=s, url_for=url_for)
-    return render_admin("Termux গাইড","guide", html)
+    return render_admin("Termux গাইড", "guide", html)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global Error Handler (Prevents blank Internal Server Error)
+# Global Error Handler
 # ─────────────────────────────────────────────────────────────────────────────
 @app.errorhandler(500)
 @app.errorhandler(Exception)
 def handle_error(e):
-    import traceback
-    err_trace = traceback.format_exc()
-    print("[ERROR]", err_trace)
-    # Attempt DB self-healing
     try:
         init_db()
     except Exception:
         pass
     return f"""
-    <!DOCTYPE html><html><head><meta charset='utf-8'><title>System Notice</title>
+    <!DOCTYPE html><html><head><meta charset='utf-8'><title>Notice</title>
     <style>body{{font-family:sans-serif;padding:24px;background:#f8fafc;color:#1e293b}}
     .box{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;max-width:500px;margin:30px auto;box-shadow:0 4px 12px rgba(0,0,0,0.05)}}
     .btn{{display:inline-block;padding:10px 16px;background:#007bff;color:#fff;border-radius:6px;text-decoration:none;margin-top:12px}}</style>
     </head><body><div class='box'>
-    <h3>⚠️ সিস্টেমে সাময়িক সমস্যা হয়েছে</h3>
-    <p>ডাটাবেস স্বয়ংক্রিয়ভাবে রিকভার করা হয়েছে। অনুগ্রহ করে পেজটি রিফ্রেশ করুন।</p>
-    <a href='/' class='btn'>🔄 পেজ রিফ্রেশ করুন</a>
+    <h3>⚠️ সিস্টেমে সাময়িক নোটিশ</h3>
+    <p>ডাটাবেস রিকভারি সফল হয়েছে। নিচের বাটনে চাপ দিয়ে পোর্টালে ফিরুন।</p>
+    <a href='/' class='btn'>🔄 পোর্টালে যান</a>
     </div></body></html>
     """, 500
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Startup
+# Startup & Background Threads
 # ─────────────────────────────────────────────────────────────────────────────
 def banner():
     print("=" * 60)
@@ -1741,8 +1786,12 @@ def banner():
     print("  Login  : admin / admin")
     print("=" * 60)
 
-# Always initialize on start
+# Initialize DB on load
 init_db()
+
+# Start background expiration thread
+worker_thread = threading.Thread(target=expiration_worker, daemon=True)
+worker_thread.start()
 
 if __name__ == "__main__":
     banner()
