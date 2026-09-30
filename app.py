@@ -5,161 +5,170 @@
         MIKROTIK-STYLE CAPTIVE PORTAL & WIFI HOTSPOT MANAGEMENT SYSTEM
                         Optimized for Termux (Android)
 =============================================================================
-Author: Expert Python & Networking Specialist
-Framework: Flask (Single-File Architecture)
-Database: Built-in SQLite3
-Compatibility: Termux (Android), Linux, Windows (for local testing)
-=============================================================================
 """
 
 import os
-import sys
 import sqlite3
 import random
-import string
 import subprocess
 from datetime import datetime
 from functools import wraps
 from flask import (
-    Flask, request, redirect, url_for, session, 
-    render_template_string, jsonify, flash
+    Flask, request, redirect, url_for, session,
+    render_template_string, flash, Response
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# ---------------------------------------------------------------------------
-# Application Configuration
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# App Config
+# ─────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "mikrotik_hotspot_secret_key_2026_termux")
+app.secret_key = os.environ.get("SECRET_KEY", "hotspot_secret_mikrotik_2026")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "hotspot.db")
-PORT = 8080
-HOST = "0.0.0.0"
+DB_PATH  = os.path.join(BASE_DIR, "hotspot.db")
+HOST     = "0.0.0.0"
+PORT     = 8080
 
-# ---------------------------------------------------------------------------
-# Database Management
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Database
+# ─────────────────────────────────────────────────────────────────────────────
 def get_db():
-    """Connects to SQLite database with Row factory."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """Initializes tables and default admin credentials if not existing."""
     conn = get_db()
-    cursor = conn.cursor()
-    
-    # 1. Admin Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS admin_users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # 2. Vouchers / PIN Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS vouchers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pin TEXT UNIQUE NOT NULL,
-            status TEXT DEFAULT 'active', -- active, used
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            used_at TIMESTAMP,
-            used_by_ip TEXT
-        )
-    """)
-    
-    # 3. Active Sessions Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS active_sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_ip TEXT UNIQUE NOT NULL,
-            pin TEXT NOT NULL,
-            login_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            user_agent TEXT
-        )
-    """)
-    
-    # Insert default admin: admin / admin
-    cursor.execute("SELECT id FROM admin_users WHERE username = 'admin'")
-    if not cursor.fetchone():
-        hashed = generate_password_hash("admin")
-        cursor.execute("INSERT INTO admin_users (username, password_hash) VALUES (?, ?)", ("admin", hashed))
-        print("[*] Default admin created: Username: admin | Password: admin")
-        
+    c = conn.cursor()
+
+    c.execute("""CREATE TABLE IF NOT EXISTS admin_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS vouchers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pin TEXT UNIQUE NOT NULL,
+        status TEXT DEFAULT 'active',
+        created_at TEXT DEFAULT (datetime('now','localtime')),
+        used_at TEXT,
+        used_by_ip TEXT
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS active_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_ip TEXT UNIQUE NOT NULL,
+        pin TEXT NOT NULL,
+        login_time TEXT DEFAULT (datetime('now','localtime')),
+        user_agent TEXT
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS site_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""")
+
+    # Default admin
+    c.execute("SELECT id FROM admin_users WHERE username='admin'")
+    if not c.fetchone():
+        c.execute("INSERT INTO admin_users (username,password_hash) VALUES (?,?)",
+                  ("admin", generate_password_hash("admin")))
+        print("[*] Default admin created → username: admin | password: admin")
+
+    # Default site settings
+    defaults = {
+        "site_name":       "WiFi Hotspot Portal",
+        "site_subtitle":   "High Speed Wireless Network",
+        "welcome_text":    "ইন্টারনেট ব্যবহার করতে আপনার ভাউচার পিন দিন।",
+        "hotspot_name":    "MikroTik HotSpot",
+        "footer_text":     "পিনের জন্য অ্যাডমিনের সাথে যোগাযোগ করুন।",
+        "primary_color":   "#007bff",
+        "gateway_ip":      "192.168.43.1",
+    }
+    for k, v in defaults.items():
+        c.execute("INSERT OR IGNORE INTO site_settings (key,value) VALUES (?,?)", (k, v))
+
     conn.commit()
     conn.close()
 
-# ---------------------------------------------------------------------------
-# Termux / Linux Network Helper Functions (IPTables Integration)
-# ---------------------------------------------------------------------------
-def execute_system_cmd(cmd_list):
-    """Executes a system shell command safely (for Termux root/tsu environments)."""
-    try:
-        res = subprocess.run(cmd_list, capture_output=True, text=True, check=False)
-        return res.returncode == 0, res.stdout, res.stderr
-    except Exception as e:
-        return False, "", str(e)
-
-def allow_client_internet(client_ip):
-    """
-    Grants internet access to the authenticated client IP in iptables.
-    Works automatically when Termux is running as root (tsu).
-    """
-    if os.name != 'nt':  # Linux / Android Termux
-        # Insert ACCEPT rule before captive portal REDIRECT in PREROUTING or FORWARD
-        # 1. Allow forwarding for this IP
-        execute_system_cmd(["iptables", "-I", "FORWARD", "-s", client_ip, "-j", "ACCEPT"])
-        execute_system_cmd(["iptables", "-I", "FORWARD", "-d", client_ip, "-j", "ACCEPT"])
-        # 2. Bypass captive portal redirect in NAT table
-        execute_system_cmd(["iptables", "-t", "nat", "-I", "PREROUTING", "-s", client_ip, "-j", "ACCEPT"])
-
-def revoke_client_internet(client_ip):
-    """Removes iptables exception when an admin kicks or user logs out."""
-    if os.name != 'nt':
-        execute_system_cmd(["iptables", "-D", "FORWARD", "-s", client_ip, "-j", "ACCEPT"])
-        execute_system_cmd(["iptables", "-D", "FORWARD", "-d", client_ip, "-j", "ACCEPT"])
-        execute_system_cmd(["iptables", "-t", "nat", "-D", "PREROUTING", "-s", client_ip, "-j", "ACCEPT"])
-
-def get_client_ip():
-    """Accurately detect client IP, handling proxies if configured."""
-    if request.headers.get("X-Forwarded-For"):
-        return request.headers.get("X-Forwarded-For").split(",")[0].strip()
-    return request.remote_addr or "127.0.0.1"
-
-def is_ip_authenticated(client_ip):
-    """Checks if client IP has an active session."""
+def get_settings():
+    """Returns site_settings as a plain dict."""
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM active_sessions WHERE client_ip = ?", (client_ip,))
-    row = cursor.fetchone()
+    rows = conn.execute("SELECT key,value FROM site_settings").fetchall()
+    conn.close()
+    return {r["key"]: r["value"] for r in rows}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def client_ip():
+    xff = request.headers.get("X-Forwarded-For")
+    return xff.split(",")[0].strip() if xff else (request.remote_addr or "127.0.0.1")
+
+def is_authenticated(ip):
+    conn = get_db()
+    row = conn.execute("SELECT id FROM active_sessions WHERE client_ip=?", (ip,)).fetchone()
     conn.close()
     return row is not None
 
-# ---------------------------------------------------------------------------
-# Authentication Decorator
-# ---------------------------------------------------------------------------
+def allow_ip(ip):
+    if os.name != "nt":
+        for cmd in [
+            ["iptables", "-I", "FORWARD", "-s", ip, "-j", "ACCEPT"],
+            ["iptables", "-I", "FORWARD", "-d", ip, "-j", "ACCEPT"],
+            ["iptables", "-t", "nat", "-I", "PREROUTING", "-s", ip, "-j", "ACCEPT"],
+        ]:
+            subprocess.run(cmd, capture_output=True)
+
+def revoke_ip(ip):
+    if os.name != "nt":
+        for cmd in [
+            ["iptables", "-D", "FORWARD", "-s", ip, "-j", "ACCEPT"],
+            ["iptables", "-D", "FORWARD", "-d", ip, "-j", "ACCEPT"],
+            ["iptables", "-t", "nat", "-D", "PREROUTING", "-s", ip, "-j", "ACCEPT"],
+        ]:
+            subprocess.run(cmd, capture_output=True)
+
 def admin_required(f):
     @wraps(f)
-    def decorated_function(*args, **kwargs):
+    def wrapper(*args, **kwargs):
         if not session.get("admin_logged_in"):
-            flash("অনুগ্রহ করে আগে অ্যাডমিন প্যানেলে লগইন করুন।", "danger")
+            flash("অনুগ্রহ করে আগে লগইন করুন।", "danger")
             return redirect(url_for("admin_login"))
         return f(*args, **kwargs)
-    return decorated_function
+    return wrapper
 
-# ---------------------------------------------------------------------------
-# HTML & CSS Embedded Templates (MikroTik Inspired UI)
-# ---------------------------------------------------------------------------
-BASE_CSS = """
-:root {
-    --primary: #007bff;
-    --primary-dark: #0056b3;
-    --secondary: #17a2b8;
+# ─────────────────────────────────────────────────────────────────────────────
+# Captive Portal Middleware
+# ─────────────────────────────────────────────────────────────────────────────
+BYPASS_PATHS = {"/", "/login", "/status", "/user-logout",
+                "/generate_204", "/gen_204", "/hotspot-detect.html",
+                "/ncsi.txt", "/canonical.html", "/connecttest.txt",
+                "/favicon.ico"}
+
+@app.before_request
+def captive_redirect():
+    """Redirect unauthenticated clients to login page for every request."""
+    path = request.path
+    # Always allow admin routes and bypass paths
+    if path.startswith("/admin") or path.startswith("/static"):
+        return None
+    if path in BYPASS_PATHS:
+        return None
+    ip = client_ip()
+    if not is_authenticated(ip):
+        return redirect(url_for("portal_index"), 302)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS (shared)
+# ─────────────────────────────────────────────────────────────────────────────
+def base_css(primary="#007bff"):
+    return f"""
+:root {{
+    --primary: {primary};
+    --primary-d: color-mix(in srgb, {primary} 80%, black);
     --dark: #1b263b;
     --light: #f4f6f9;
     --surface: #ffffff;
@@ -168,1064 +177,748 @@ BASE_CSS = """
     --warning: #ffc107;
     --border: #e2e8f0;
     --text: #2d3748;
-    --text-muted: #718096;
+    --muted: #718096;
     --radius: 12px;
-    --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
-}
-
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-}
-
-body {
-    background-color: var(--light);
-    color: var(--text);
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-}
+    --shadow: 0 10px 25px -5px rgba(0,0,0,.12);
+}}
+*{{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}}
+body{{background:var(--light);color:var(--text);min-height:100vh}}
+a{{color:var(--primary);text-decoration:none}}
 
 /* Navbar */
-.navbar {
-    background: var(--dark);
-    color: white;
-    padding: 14px 24px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.15);
-}
+.navbar{{background:var(--dark);color:#fff;padding:13px 22px;display:flex;justify-content:space-between;align-items:center;box-shadow:0 2px 8px rgba(0,0,0,.2)}}
+.navbar .brand{{font-size:1.15rem;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px}}
+.nav-links{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
+.nav-link{{color:#cbd5e0;font-size:.88rem;padding:6px 11px;border-radius:6px;transition:.2s}}
+.nav-link:hover,.nav-link.active{{color:#fff;background:rgba(255,255,255,.12)}}
+.btn-logout{{background:var(--danger);color:#fff;padding:6px 13px;border-radius:6px;font-size:.83rem;font-weight:600}}
 
-.navbar .brand {
-    font-size: 1.25rem;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: #fff;
-    text-decoration: none;
-}
-
-.navbar .nav-links {
-    display: flex;
-    align-items: center;
-    gap: 15px;
-}
-
-.navbar a.nav-link {
-    color: #cbd5e0;
-    text-decoration: none;
-    font-size: 0.9rem;
-    padding: 6px 12px;
-    border-radius: 6px;
-    transition: 0.2s;
-}
-
-.navbar a.nav-link:hover, .navbar a.nav-link.active {
-    color: white;
-    background: rgba(255, 255, 255, 0.1);
-}
-
-.btn-logout {
-    background: var(--danger);
-    color: white;
-    padding: 6px 14px;
-    border-radius: 6px;
-    text-decoration: none;
-    font-size: 0.85rem;
-    font-weight: 600;
-}
-
-/* Containers */
-.container {
-    max-width: 1100px;
-    margin: 30px auto;
-    padding: 0 20px;
-    width: 100%;
-}
+/* Container */
+.container{{max-width:1100px;margin:28px auto;padding:0 18px;width:100%}}
 
 /* Card */
-.card {
-    background: var(--surface);
-    border-radius: var(--radius);
-    padding: 24px;
-    box-shadow: var(--shadow);
-    border: 1px solid var(--border);
-    margin-bottom: 24px;
-}
+.card{{background:#fff;border-radius:var(--radius);padding:22px;box-shadow:var(--shadow);border:1px solid var(--border);margin-bottom:22px}}
+.card h3{{margin-bottom:14px;font-size:1.05rem;color:var(--dark)}}
 
-/* Form inputs & buttons */
-.form-group {
-    margin-bottom: 18px;
-}
+/* Form */
+.form-group{{margin-bottom:16px}}
+label{{display:block;margin-bottom:5px;font-size:.88rem;font-weight:600}}
+.form-control{{width:100%;padding:11px 15px;border:1.5px solid var(--border);border-radius:8px;font-size:.97rem;outline:none;transition:.2s;background:#fff}}
+.form-control:focus{{border-color:var(--primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary) 20%,transparent)}}
 
-label {
-    display: block;
-    margin-bottom: 6px;
-    font-size: 0.9rem;
-    font-weight: 600;
-    color: var(--text);
-}
-
-.form-control {
-    width: 100%;
-    padding: 12px 16px;
-    border: 1.5px solid var(--border);
-    border-radius: 8px;
-    font-size: 1rem;
-    outline: none;
-    transition: 0.2s;
-}
-
-.form-control:focus {
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.15);
-}
-
-.btn {
-    display: inline-block;
-    padding: 11px 20px;
-    font-size: 0.95rem;
-    font-weight: 600;
-    border-radius: 8px;
-    cursor: pointer;
-    border: none;
-    text-decoration: none;
-    text-align: center;
-    transition: 0.2s;
-}
-
-.btn-primary { background: var(--primary); color: white; }
-.btn-primary:hover { background: var(--primary-dark); }
-.btn-success { background: var(--success); color: white; }
-.btn-danger { background: var(--danger); color: white; }
-.btn-dark { background: var(--dark); color: white; }
-.btn-sm { padding: 6px 12px; font-size: 0.8rem; }
-.btn-block { width: 100%; }
+/* Buttons */
+.btn{{display:inline-block;padding:10px 18px;font-size:.92rem;font-weight:600;border-radius:8px;cursor:pointer;border:none;text-align:center;transition:.2s;line-height:1.4}}
+.btn-primary{{background:var(--primary);color:#fff}}
+.btn-primary:hover{{background:var(--primary-d)}}
+.btn-success{{background:var(--success);color:#fff}}
+.btn-success:hover{{background:#1e7e34}}
+.btn-danger{{background:var(--danger);color:#fff}}
+.btn-danger:hover{{background:#bd2130}}
+.btn-warning{{background:var(--warning);color:#333}}
+.btn-secondary{{background:#6c757d;color:#fff}}
+.btn-block{{width:100%}}
+.btn-sm{{padding:5px 11px;font-size:.8rem}}
 
 /* Alerts */
-.alert {
-    padding: 12px 16px;
-    border-radius: 8px;
-    margin-bottom: 20px;
-    font-size: 0.9rem;
-}
-.alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-.alert-danger { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-.alert-warning { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
-.alert-info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+.alert{{padding:11px 15px;border-radius:8px;margin-bottom:18px;font-size:.88rem}}
+.alert-success{{background:#d4edda;color:#155724;border:1px solid #c3e6cb}}
+.alert-danger{{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb}}
+.alert-warning{{background:#fff3cd;color:#856404;border:1px solid #ffeeba}}
+.alert-info{{background:#d1ecf1;color:#0c5460;border:1px solid #bee5eb}}
 
-/* Badges */
-.badge {
-    display: inline-block;
-    padding: 4px 10px;
-    border-radius: 20px;
-    font-size: 0.75rem;
-    font-weight: 700;
-    text-transform: uppercase;
-}
-.badge-success { background: #28a745; color: white; }
-.badge-secondary { background: #6c757d; color: white; }
-.badge-primary { background: #007bff; color: white; }
+/* Badge */
+.badge{{display:inline-block;padding:3px 9px;border-radius:20px;font-size:.72rem;font-weight:700;text-transform:uppercase}}
+.badge-success{{background:var(--success);color:#fff}}
+.badge-secondary{{background:#6c757d;color:#fff}}
+.badge-primary{{background:var(--primary);color:#fff}}
+.badge-warning{{background:var(--warning);color:#333}}
 
-/* Tables */
-.table-responsive {
-    overflow-x: auto;
-}
-table {
-    width: 100%;
-    border-collapse: collapse;
-    margin-top: 10px;
-}
-th, td {
-    padding: 12px 16px;
-    text-align: left;
-    border-bottom: 1px solid var(--border);
-    font-size: 0.9rem;
-}
-th {
-    background: #f8fafc;
-    color: var(--text-muted);
-    font-weight: 600;
-}
-tr:hover { background: #f8fafc; }
+/* Table */
+.table-responsive{{overflow-x:auto}}
+table{{width:100%;border-collapse:collapse}}
+th,td{{padding:11px 14px;text-align:left;border-bottom:1px solid var(--border);font-size:.88rem}}
+th{{background:#f8fafc;color:var(--muted);font-weight:600}}
+tr:hover td{{background:#f8fafc}}
 
-/* Grid stats */
-.stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 20px;
-    margin-bottom: 25px;
-}
-.stat-box {
-    background: white;
-    border-radius: var(--radius);
-    padding: 20px;
-    border: 1px solid var(--border);
-    box-shadow: 0 4px 6px rgba(0,0,0,0.03);
-    border-left: 5px solid var(--primary);
-}
-.stat-box.green { border-left-color: var(--success); }
-.stat-box.orange { border-left-color: var(--warning); }
-.stat-box.red { border-left-color: var(--danger); }
-.stat-box h3 { font-size: 1.8rem; margin-bottom: 5px; color: var(--dark); }
-.stat-box p { font-size: 0.85rem; color: var(--text-muted); font-weight: 500; }
+/* Stats grid */
+.stats-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:18px;margin-bottom:22px}}
+.stat-box{{background:#fff;border-radius:var(--radius);padding:18px;border:1px solid var(--border);box-shadow:0 2px 6px rgba(0,0,0,.04);border-left:5px solid var(--primary)}}
+.stat-box.green{{border-left-color:var(--success)}}
+.stat-box.orange{{border-left-color:var(--warning)}}
+.stat-box.red{{border-left-color:var(--danger)}}
+.stat-box h3{{font-size:1.75rem;margin-bottom:4px;color:var(--dark)}}
+.stat-box p{{font-size:.82rem;color:var(--muted);font-weight:500}}
 
-/* Terminal code box */
-pre.terminal {
-    background: #111827;
-    color: #10b981;
-    padding: 16px;
-    border-radius: 8px;
-    font-family: monospace;
-    font-size: 0.85rem;
-    overflow-x: auto;
-    line-height: 1.5;
-    margin: 10px 0;
-}
+/* Voucher cards */
+.voucher-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-top:14px}}
+.voucher-card{{border:2px dashed var(--primary);background:#f0f7ff;padding:13px;border-radius:8px;text-align:center}}
+.voucher-card .pin{{font-size:1.55rem;font-weight:800;letter-spacing:5px;color:var(--primary-d);margin:5px 0}}
 
-/* Voucher Cards Preview for Printing */
-.voucher-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 15px;
-    margin-top: 15px;
-}
-.voucher-card {
-    border: 2px dashed #007bff;
-    background: #f0f7ff;
-    padding: 14px;
-    border-radius: 8px;
-    text-align: center;
-}
-.voucher-card .pin {
-    font-size: 1.6rem;
-    font-weight: 800;
-    letter-spacing: 5px;
-    color: #0056b3;
-    margin: 6px 0;
-}
+/* Terminal block */
+pre.terminal{{background:#0d1117;color:#3fb950;padding:14px;border-radius:8px;font-family:monospace;font-size:.83rem;overflow-x:auto;line-height:1.6;margin:8px 0}}
+
+/* Color swatch */
+.color-preview{{width:36px;height:36px;border-radius:6px;border:1px solid var(--border);display:inline-block;vertical-align:middle;margin-left:8px}}
+
+@media(max-width:600px){{
+    .navbar{{flex-direction:column;gap:10px;text-align:center}}
+    .nav-links{{justify-content:center}}
+}}
 """
 
-LOGIN_HTML = """
-<!DOCTYPE html>
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin base renderer  (no Jinja2 extends — avoids the template-variable bug)
+# ─────────────────────────────────────────────────────────────────────────────
+ADMIN_BASE_TMPL = """<!DOCTYPE html>
 <html lang="bn">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>MikroTik Hotspot Portal</title>
-    <style>
-        {{ css | safe }}
-        body {
-            background: linear-gradient(135deg, #0d1b2a 0%, #1b263b 100%);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        .portal-card {
-            background: #ffffff;
-            width: 100%;
-            max-width: 400px;
-            border-radius: 16px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
-            overflow: hidden;
-            text-align: center;
-        }
-        .portal-header {
-            background: #007bff;
-            padding: 30px 20px;
-            color: white;
-        }
-        .portal-header .logo-icon {
-            font-size: 40px;
-            margin-bottom: 8px;
-        }
-        .portal-header h2 {
-            font-size: 1.4rem;
-            font-weight: 700;
-            letter-spacing: 0.5px;
-        }
-        .portal-header p {
-            font-size: 0.85rem;
-            opacity: 0.9;
-            margin-top: 4px;
-        }
-        .portal-body {
-            padding: 28px 24px;
-        }
-        .pin-input {
-            letter-spacing: 12px;
-            font-size: 2rem;
-            text-align: center;
-            font-weight: 800;
-            color: #0d1b2a;
-            border: 2px solid #cbd5e0;
-            height: 60px;
-            border-radius: 10px;
-        }
-        .pin-input:focus {
-            border-color: #007bff;
-        }
-        .client-info {
-            background: #f8fafc;
-            border: 1px solid #e2e8f0;
-            padding: 10px 14px;
-            border-radius: 8px;
-            font-size: 0.8rem;
-            color: var(--text-muted);
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-        }
-        .footer-note {
-            font-size: 0.75rem;
-            color: var(--text-muted);
-            margin-top: 20px;
-        }
-        .admin-link {
-            display: inline-block;
-            margin-top: 15px;
-            font-size: 0.8rem;
-            color: #64748b;
-            text-decoration: none;
-        }
-        .admin-link:hover { text-decoration: underline; color: #007bff; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }} — Hotspot Admin</title>
+<style>{{ css | safe }}</style>
 </head>
 <body>
-    <div class="portal-card">
-        <div class="portal-header">
-            <div class="logo-icon">📶</div>
-            <h2>WIFI HOTSPOT PORTAL</h2>
-            <p>MikroTik High Speed Wireless Network</p>
-        </div>
-        <div class="portal-body">
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="alert alert-{{ category }}">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
-
-            <div class="client-info">
-                <span>🌐 Client IP: <strong>{{ client_ip }}</strong></span>
-                <span>⚡ Status: <strong>লগইন প্রয়োজন</strong></span>
-            </div>
-
-            <form action="{{ url_for('login') }}" method="POST">
-                <div class="form-group">
-                    <label for="pin">৪-ডিজিট ভাউচার পিন দিন (Voucher PIN)</label>
-                    <input 
-                        type="text" 
-                        name="pin" 
-                        id="pin" 
-                        class="form-control pin-input" 
-                        placeholder="••••" 
-                        maxlength="4" 
-                        pattern="[0-9]{4}" 
-                        inputmode="numeric" 
-                        required 
-                        autofocus
-                    >
-                </div>
-                <button type="submit" class="btn btn-primary btn-block" style="padding: 14px; font-size: 1.05rem;">
-                    🚀 কানেক্ট করুন (Connect Internet)
-                </button>
-            </form>
-
-            <p class="footer-note">
-                ভাউচার পিন পেতে অনুগ্রহ করে হটস্পট অ্যাডমিনের সাথে যোগাযোগ করুন।
-            </p>
-            <a href="{{ url_for('admin_login') }}" class="admin-link">⚙️ Admin Login</a>
-        </div>
-    </div>
+<nav class="navbar">
+  <a href="{{ url_for('admin_dashboard') }}" class="brand">📡 {{ s.hotspot_name }}</a>
+  <div class="nav-links">
+    <a href="{{ url_for('admin_dashboard') }}"   class="nav-link {{ 'active' if ap=='dashboard' }}">📊 ড্যাশবোর্ড</a>
+    <a href="{{ url_for('admin_vouchers') }}"    class="nav-link {{ 'active' if ap=='vouchers'  }}">🎟️ ভাউচার</a>
+    <a href="{{ url_for('admin_site_settings') }}" class="nav-link {{ 'active' if ap=='site'   }}">🎨 সাইট সেটিংস</a>
+    <a href="{{ url_for('admin_settings') }}"    class="nav-link {{ 'active' if ap=='settings' }}">⚙️ অ্যাডমিন</a>
+    <a href="{{ url_for('admin_termux_guide') }}" class="nav-link {{ 'active' if ap=='guide'   }}">📱 গাইড</a>
+    <a href="{{ url_for('admin_logout') }}" class="btn-logout">লগআউট</a>
+  </div>
+</nav>
+<div class="container">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}{% for cat,msg in messages %}
+      <div class="alert alert-{{ cat }}">{{ msg }}</div>
+    {% endfor %}{% endif %}
+  {% endwith %}
+  {{ page_content | safe }}
+</div>
 </body>
-</html>
-"""
+</html>"""
 
-STATUS_HTML = """
-<!DOCTYPE html>
+def render_admin(title, ap, content_html):
+    s = get_settings()
+    css = base_css(s.get("primary_color", "#007bff"))
+    return render_template_string(
+        ADMIN_BASE_TMPL,
+        title=title, ap=ap, s=s, css=css,
+        page_content=content_html
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ══  USER-FACING TEMPLATES  ══
+# ─────────────────────────────────────────────────────────────────────────────
+PORTAL_LOGIN_TMPL = """<!DOCTYPE html>
 <html lang="bn">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Connected - WiFi Hotspot</title>
-    <style>
-        {{ css | safe }}
-        body {
-            background: linear-gradient(135deg, #0d1b2a 0%, #1b263b 100%);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        .status-card {
-            background: white;
-            border-radius: 16px;
-            max-width: 440px;
-            width: 100%;
-            padding: 32px 24px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
-            text-align: center;
-        }
-        .success-icon {
-            font-size: 56px;
-            color: #28a745;
-            margin-bottom: 12px;
-        }
-        .info-table {
-            margin: 20px 0;
-            background: #f8fafc;
-            border-radius: 8px;
-            border: 1px solid #e2e8f0;
-        }
-        .info-table td {
-            padding: 10px 14px;
-            font-size: 0.88rem;
-        }
-        .info-table td:first-child {
-            color: var(--text-muted);
-            font-weight: 500;
-        }
-        .info-table td:last-child {
-            text-align: right;
-            font-weight: 600;
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>{{ s.site_name }}</title>
+<style>
+{{ css | safe }}
+body{
+  background: linear-gradient(135deg, #0d1b2a 0%, #1b263b 100%);
+  display:flex; align-items:center; justify-content:center; padding:20px;
+}
+.portal-card{
+  background:#fff; width:100%; max-width:400px;
+  border-radius:18px; box-shadow:0 24px 48px rgba(0,0,0,.35); overflow:hidden;
+}
+.portal-head{
+  background: var(--primary); padding:28px 20px; color:#fff; text-align:center;
+}
+.portal-head .icon{ font-size:44px; margin-bottom:8px; }
+.portal-head h2{ font-size:1.35rem; font-weight:700; letter-spacing:.4px; }
+.portal-head p{ font-size:.85rem; opacity:.9; margin-top:3px; }
+.portal-body{ padding:26px 22px; }
+.pin-input{
+  letter-spacing:14px; font-size:2rem; text-align:center;
+  font-weight:800; height:62px; border:2px solid var(--border);
+  border-radius:10px; color:var(--dark);
+}
+.pin-input:focus{ border-color:var(--primary); }
+.client-info{
+  background:#f8fafc; border:1px solid var(--border);
+  padding:9px 13px; border-radius:8px; font-size:.78rem;
+  color:var(--muted); margin-bottom:18px;
+  display:flex; justify-content:space-between;
+}
+.footer-note{ font-size:.75rem; color:var(--muted); margin-top:18px; text-align:center; }
+.admin-link{ display:block; text-align:center; margin-top:14px; font-size:.78rem; color:#64748b; }
+.admin-link:hover{ color:var(--primary); }
+</style>
 </head>
 <body>
-    <div class="status-card">
-        <div class="success-icon">✓</div>
-        <h2 style="color: #28a745; margin-bottom: 6px;">ইন্টারনেট এক্টিভেটেড!</h2>
-        <p style="color: var(--text-muted); font-size: 0.9rem;">আপনি সফলভাবে ওয়াইফাই নেটওয়ার্কে যুক্ত হয়েছেন।</p>
+<div class="portal-card">
+  <div class="portal-head" style="background:{{ s.primary_color }}">
+    <div class="icon">📶</div>
+    <h2>{{ s.site_name }}</h2>
+    <p>{{ s.site_subtitle }}</p>
+  </div>
+  <div class="portal-body">
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% for cat,msg in msgs %}
+        <div class="alert alert-{{ cat }}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
 
-        <table class="info-table">
-            <tr>
-                <td>IP Address:</td>
-                <td>{{ session_data.client_ip }}</td>
-            </tr>
-            <tr>
-                <td>Voucher PIN:</td>
-                <td>{{ session_data.pin }}</td>
-            </tr>
-            <tr>
-                <td>Login Time:</td>
-                <td>{{ session_data.login_time }}</td>
-            </tr>
-            <tr>
-                <td>Status:</td>
-                <td><span class="badge badge-success">Online</span></td>
-            </tr>
-        </table>
-
-        <div style="display: flex; gap: 10px;">
-            <a href="https://www.google.com" class="btn btn-primary" style="flex: 1;">🌐 গুগল ব্রাউজ করুন</a>
-            <form action="{{ url_for('user_logout') }}" method="POST" style="flex: 1;">
-                <button type="submit" class="btn btn-danger btn-block">ডিসকানেক্ট</button>
-            </form>
-        </div>
+    <div class="client-info">
+      <span>🌐 IP: <strong>{{ ip }}</strong></span>
+      <span>⚡ লগইন প্রয়োজন</span>
     </div>
-</body>
-</html>
-"""
 
-ADMIN_BASE = """
-<!DOCTYPE html>
+    <form method="POST" action="{{ url_for('login') }}">
+      <div class="form-group">
+        <label>{{ s.welcome_text }}</label>
+        <input name="pin" class="form-control pin-input"
+               placeholder="••••" maxlength="4"
+               inputmode="numeric" pattern="[0-9]{4}"
+               required autofocus>
+      </div>
+      <button type="submit" class="btn btn-primary btn-block"
+              style="padding:14px;font-size:1.05rem;background:{{ s.primary_color }}">
+        🚀 ইন্টারনেট চালু করুন
+      </button>
+    </form>
+
+    <p class="footer-note">{{ s.footer_text }}</p>
+    <a href="{{ url_for('admin_login') }}" class="admin-link">⚙️ Admin Panel</a>
+  </div>
+</div>
+</body>
+</html>"""
+
+STATUS_TMPL = """<!DOCTYPE html>
 <html lang="bn">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }} - Hotspot Admin</title>
-    <style>{{ css | safe }}</style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connected — {{ s.site_name }}</title>
+<style>
+{{ css | safe }}
+body{
+  background:linear-gradient(135deg,#0d1b2a 0%,#1b263b 100%);
+  display:flex; align-items:center; justify-content:center; padding:20px;
+}
+.status-card{
+  background:#fff; border-radius:18px; max-width:440px; width:100%;
+  padding:32px 24px; box-shadow:0 24px 48px rgba(0,0,0,.35); text-align:center;
+}
+.check{ font-size:56px; color:var(--success); margin-bottom:10px; }
+.info-tbl{ margin:18px 0; background:#f8fafc; border-radius:8px; border:1px solid var(--border); }
+.info-tbl td{ padding:10px 14px; font-size:.87rem; }
+.info-tbl td:first-child{ color:var(--muted); font-weight:500; }
+.info-tbl td:last-child{ text-align:right; font-weight:600; }
+.actions{ display:flex; gap:10px; margin-top:4px; }
+.actions a,.actions button{ flex:1; }
+</style>
 </head>
 <body>
-    <nav class="navbar">
-        <a href="{{ url_for('admin_dashboard') }}" class="brand">
-            📡 MikroTik Hotspot Panel
-        </a>
-        <div class="nav-links">
-            <a href="{{ url_for('admin_dashboard') }}" class="nav-link {% if active_page == 'dashboard' %}active{% endif %}">📊 ড্যাশবোর্ড</a>
-            <a href="{{ url_for('admin_vouchers') }}" class="nav-link {% if active_page == 'vouchers' %}active{% endif %}">🎟️ ভাউচার পিন</a>
-            <a href="{{ url_for('admin_termux_guide') }}" class="nav-link {% if active_page == 'guide' %}active{% endif %}">📱 টার্মাক্স গাইড</a>
-            <a href="{{ url_for('admin_settings') }}" class="nav-link {% if active_page == 'settings' %}active{% endif %}">⚙️ সেটিংস</a>
-            <a href="{{ url_for('admin_logout') }}" class="btn-logout">লগআউট</a>
-        </div>
-    </nav>
+<div class="status-card">
+  <div class="check">✓</div>
+  <h2 style="color:var(--success);margin-bottom:6px">ইন্টারনেট চালু!</h2>
+  <p style="color:var(--muted);font-size:.9rem">আপনি সফলভাবে কানেক্টেড।</p>
 
-    <div class="container">
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
+  <table class="info-tbl">
+    <tr><td>IP Address</td><td>{{ sess.client_ip }}</td></tr>
+    <tr><td>Voucher PIN</td><td>{{ sess.pin }}</td></tr>
+    <tr><td>Login Time</td><td>{{ sess.login_time }}</td></tr>
+    <tr><td>Status</td><td><span class="badge badge-success">ONLINE</span></td></tr>
+  </table>
 
-        {% block content %}{% endblock %}
-    </div>
+  <div class="actions">
+    <a href="https://www.google.com" class="btn btn-primary">🌐 Browse</a>
+    <form method="POST" action="{{ url_for('user_logout') }}" style="flex:1">
+      <button type="submit" class="btn btn-danger btn-block">ডিসকানেক্ট</button>
+    </form>
+  </div>
+</div>
 </body>
-</html>
-"""
+</html>"""
 
-ADMIN_LOGIN_HTML = """
-<!DOCTYPE html>
+# ─────────────────────────────────────────────────────────────────────────────
+# ══  ADMIN CONTENT TEMPLATES  ══
+# ─────────────────────────────────────────────────────────────────────────────
+ADMIN_LOGIN_TMPL = """<!DOCTYPE html>
 <html lang="bn">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Login - Hotspot Panel</title>
-    <style>
-        {{ css | safe }}
-        body {
-            background: #0f172a;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        .login-box {
-            background: white;
-            border-radius: 14px;
-            padding: 30px;
-            width: 100%;
-            max-width: 380px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.3);
-        }
-        .login-box h3 {
-            text-align: center;
-            margin-bottom: 20px;
-            color: #0f172a;
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin Login</title>
+<style>
+{{ css | safe }}
+body{ background:#0f172a; display:flex; align-items:center; justify-content:center; padding:20px; }
+.box{ background:#fff; border-radius:14px; padding:30px; width:100%; max-width:380px; box-shadow:0 12px 30px rgba(0,0,0,.3); }
+.box h3{ text-align:center; margin-bottom:20px; color:#0f172a; }
+</style>
 </head>
 <body>
-    <div class="login-box">
-        <h3>🔐 অ্যাডমিন লগইন</h3>
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-        <form action="{{ url_for('admin_login') }}" method="POST">
-            <div class="form-group">
-                <label for="username">ইউজারনেম (Username)</label>
-                <input type="text" name="username" id="username" class="form-control" placeholder="admin" required autofocus>
-            </div>
-            <div class="form-group">
-                <label for="password">পাসওয়ার্ড (Password)</label>
-                <input type="password" name="password" id="password" class="form-control" placeholder="admin" required>
-            </div>
-            <button type="submit" class="btn btn-primary btn-block" style="margin-top: 10px;">লগইন করুন</button>
-        </form>
-        <div style="text-align: center; margin-top: 15px;">
-            <a href="{{ url_for('portal_index') }}" style="font-size: 0.85rem; color: #64748b; text-decoration: none;">← ক্যাপটিভ পোর্টালে ফিরুন</a>
-        </div>
+<div class="box">
+  <h3>🔐 অ্যাডমিন লগইন</h3>
+  {% with msgs = get_flashed_messages(with_categories=true) %}
+    {% for cat,msg in msgs %}<div class="alert alert-{{ cat }}">{{ msg }}</div>{% endfor %}
+  {% endwith %}
+  <form method="POST">
+    <div class="form-group">
+      <label>ইউজারনেম</label>
+      <input name="username" class="form-control" placeholder="admin" required autofocus>
     </div>
+    <div class="form-group">
+      <label>পাসওয়ার্ড</label>
+      <input type="password" name="password" class="form-control" placeholder="admin" required>
+    </div>
+    <button type="submit" class="btn btn-primary btn-block" style="margin-top:8px">লগইন করুন</button>
+  </form>
+  <div style="text-align:center;margin-top:14px">
+    <a href="{{ url_for('portal_index') }}" style="font-size:.82rem;color:#64748b">← পোর্টালে ফিরুন</a>
+  </div>
+</div>
 </body>
-</html>
-"""
+</html>"""
 
-ADMIN_DASHBOARD_CONTENT = """
-{% extends base_template %}
-{% block content %}
-    <div class="stats-grid">
-        <div class="stat-box">
-            <h3>{{ stats.total_pins }}</h3>
-            <p>মোট জেনারেটেড পিন (Total)</p>
-        </div>
-        <div class="stat-box green">
-            <h3>{{ stats.active_pins }}</h3>
-            <p>অ্যাক্টিভ পিন (Unused)</p>
-        </div>
-        <div class="stat-box orange">
-            <h3>{{ stats.used_pins }}</h3>
-            <p>ব্যবহৃত পিন (Used)</p>
-        </div>
-        <div class="stat-box red">
-            <h3>{{ stats.active_users }}</h3>
-            <p>বর্তমানে অনলাইনে কানেক্টেড ইউজার</p>
-        </div>
+# ─── Dashboard ───
+DASH_CONTENT = """
+<div class="stats-grid">
+  <div class="stat-box"><h3>{{ st.total }}</h3><p>মোট পিন</p></div>
+  <div class="stat-box green"><h3>{{ st.active }}</h3><p>অ্যাক্টিভ পিন</p></div>
+  <div class="stat-box orange"><h3>{{ st.used }}</h3><p>ব্যবহৃত পিন</p></div>
+  <div class="stat-box red"><h3>{{ st.online }}</h3><p>এখন অনলাইন</p></div>
+</div>
+
+<!-- PIN Generator -->
+<div class="card">
+  <h3>⚡ ভাউচার পিন তৈরি করুন</h3>
+  <form method="POST" action="{{ url_for('admin_generate_pin') }}"
+        style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
+    <div style="flex:1;min-width:160px">
+      <label>কতগুলো পিন?</label>
+      <select name="count" class="form-control">
+        <option value="1">১টি</option>
+        <option value="5" selected>৫টি</option>
+        <option value="10">১০টি</option>
+        <option value="20">২০টি</option>
+        <option value="50">৫০টি</option>
+      </select>
     </div>
-
-    <!-- Quick PIN Generator -->
-    <div class="card">
-        <h3 style="margin-bottom: 15px;">⚡ দ্রুত ৪-ডিজিট ভাউচার পিন তৈরি করুন</h3>
-        <form action="{{ url_for('admin_generate_pin') }}" method="POST" style="display: flex; gap: 15px; flex-wrap: wrap;">
-            <div style="flex: 1; min-width: 180px;">
-                <label for="count">কতগুলো পিন জেনারেট করবেন?</label>
-                <select name="count" id="count" class="form-control">
-                    <option value="1">১টি পিন</option>
-                    <option value="5" selected>৫টি পিন (র‍্যান্ডম)</option>
-                    <option value="10">১০টি পিন (র‍্যান্ডম)</option>
-                    <option value="20">২০টি পিন (র‍্যান্ডম)</option>
-                </select>
-            </div>
-            <div style="flex: 1; min-width: 180px;">
-                <label for="custom_pin">কাস্টম ৪-ডিজিট পিন (ঐচ্ছিক):</label>
-                <input type="text" name="custom_pin" id="custom_pin" class="form-control" placeholder="যেমন: 5566" maxlength="4" pattern="[0-9]{4}">
-            </div>
-            <div style="display: flex; align-items: flex-end;">
-                <button type="submit" class="btn btn-success" style="height: 48px; padding: 0 24px;">+ পিন তৈরি করুন</button>
-            </div>
-        </form>
+    <div style="flex:1;min-width:160px">
+      <label>কাস্টম পিন (ঐচ্ছিক)</label>
+      <input name="custom_pin" class="form-control" placeholder="যেমন: 5566" maxlength="4" pattern="[0-9]{4}">
     </div>
+    <div><button type="submit" class="btn btn-success" style="height:46px;padding:0 22px">+ তৈরি করুন</button></div>
+  </form>
+</div>
 
-    <!-- Active Connected Users -->
-    <div class="card">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-            <h3>🟢 বর্তমানে কানেক্টেড ইউজারস (Active Sessions)</h3>
-            <span class="badge badge-primary">{{ active_sessions|length }} টি ডিভাইস</span>
-        </div>
-        <div class="table-responsive">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Client IP</th>
-                        <th>ব্যবহৃত ভাউচার পিন</th>
-                        <th>লগইন সময়</th>
-                        <th>অ্যাকশন</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for user in active_sessions %}
-                    <tr>
-                        <td><strong>{{ user.client_ip }}</strong></td>
-                        <td><span class="badge badge-success">{{ user.pin }}</span></td>
-                        <td>{{ user.login_time }}</td>
-                        <td>
-                            <form action="{{ url_for('admin_kick_user') }}" method="POST" style="display:inline;">
-                                <input type="hidden" name="client_ip" value="{{ user.client_ip }}">
-                                <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('এই ডিভাইসটিকে ডিসকানেক্ট করতে চান?');">Kick / Disconnect</button>
-                            </form>
-                        </td>
-                    </tr>
-                    {% else %}
-                    <tr>
-                        <td colspan="4" style="text-align: center; color: var(--text-muted); padding: 20px;">
-                            বর্তমানে কোনো ইউজার কানেক্টেড নেই।
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
+<!-- Active Sessions -->
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+    <h3>🟢 এখন কানেক্টেড ডিভাইস</h3>
+    <span class="badge badge-primary">{{ sessions|length }} টি</span>
+  </div>
+  <div class="table-responsive">
+    <table>
+      <thead><tr><th>Client IP</th><th>পিন</th><th>লগইন সময়</th><th>Action</th></tr></thead>
+      <tbody>
+      {% for u in sessions %}
+      <tr>
+        <td><strong>{{ u.client_ip }}</strong></td>
+        <td><span class="badge badge-success">{{ u.pin }}</span></td>
+        <td>{{ u.login_time }}</td>
+        <td>
+          <form method="POST" action="{{ url_for('admin_kick_user') }}" style="display:inline">
+            <input type="hidden" name="client_ip" value="{{ u.client_ip }}">
+            <button class="btn btn-danger btn-sm"
+                    onclick="return confirm('ডিসকানেক্ট করবেন?')">Kick</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">কোনো ডিভাইস নেই।</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>"""
+
+# ─── Vouchers ───
+VOUCHER_CONTENT = """
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+    <h3>🎟️ সব ভাউচার পিন</h3>
+    <form method="POST" action="{{ url_for('admin_clear_used_pins') }}" style="display:inline">
+      <button class="btn btn-danger btn-sm"
+              onclick="return confirm('সব ব্যবহৃত পিন মুছবেন?')">🗑️ ব্যবহৃত পিন মুছুন</button>
+    </form>
+  </div>
+  <div class="table-responsive">
+    <table>
+      <thead><tr><th>PIN</th><th>স্ট্যাটাস</th><th>তৈরি</th><th>ব্যবহার</th><th>IP</th><th>Action</th></tr></thead>
+      <tbody>
+      {% for p in pins %}
+      <tr>
+        <td style="font-size:1.1rem;font-weight:700;letter-spacing:3px">{{ p.pin }}</td>
+        <td>
+          {% if p.status=='active' %}<span class="badge badge-success">ACTIVE</span>
+          {% else %}<span class="badge badge-secondary">USED</span>{% endif %}
+        </td>
+        <td>{{ p.created_at }}</td>
+        <td>{{ p.used_at or '—' }}</td>
+        <td>{{ p.used_by_ip or '—' }}</td>
+        <td>
+          <form method="POST" action="{{ url_for('admin_delete_pin', pin_id=p.id) }}" style="display:inline">
+            <button class="btn btn-danger btn-sm"
+                    onclick="return confirm('পিনটি ডিলিট করবেন?')">ডিলিট</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px">কোনো পিন নেই।</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if active_pins %}
+<div class="card">
+  <h3>🖨️ প্রিন্টযোগ্য ভাউচার কার্ড</h3>
+  <p style="color:var(--muted);font-size:.83rem;margin-bottom:10px">কাস্টমারদের দেওয়ার জন্য:</p>
+  <div class="voucher-grid">
+    {% for v in active_pins %}
+    <div class="voucher-card">
+      <small style="font-weight:600;color:var(--primary)">WIFI VOUCHER</small>
+      <div class="pin">{{ v.pin }}</div>
+      <small style="color:var(--muted)">4-Digit PIN</small>
     </div>
-{% endblock %}
-"""
+    {% endfor %}
+  </div>
+</div>
+{% endif %}"""
 
-ADMIN_VOUCHERS_CONTENT = """
-{% extends base_template %}
-{% block content %}
-    <div class="card">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
-            <h3>🎟️ ভাউচার পিন ম্যানেজমেন্ট (All PINs)</h3>
-            <div>
-                <form action="{{ url_for('admin_clear_used_pins') }}" method="POST" style="display:inline;">
-                    <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('সব ব্যবহৃত পিন ডিলিট করবেন?');">
-                        🗑️ সব ব্যবহৃত পিন মুছে ফেলুন
-                    </button>
-                </form>
-            </div>
-        </div>
-
-        <div class="table-responsive">
-            <table>
-                <thead>
-                    <tr>
-                        <th>ভাউচার পিন</th>
-                        <th>স্ট্যাটাস</th>
-                        <th>তৈরির তারিখ</th>
-                        <th>ব্যবহারের সময়</th>
-                        <th>ব্যবহারকারী IP</th>
-                        <th>অ্যাকশন</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for p in pins %}
-                    <tr>
-                        <td style="font-size: 1.1rem; font-weight: 700; letter-spacing: 2px;">{{ p.pin }}</td>
-                        <td>
-                            {% if p.status == 'active' %}
-                                <span class="badge badge-success">ACTIVE</span>
-                            {% else %}
-                                <span class="badge badge-secondary">USED</span>
-                            {% endif %}
-                        </td>
-                        <td>{{ p.created_at }}</td>
-                        <td>{{ p.used_at or '-' }}</td>
-                        <td>{{ p.used_by_ip or '-' }}</td>
-                        <td>
-                            <form action="{{ url_for('admin_delete_pin', pin_id=p.id) }}" method="POST" style="display:inline;">
-                                <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('এই পিনটি ডিলিট করতে চান?');">ডিলিট</button>
-                            </form>
-                        </td>
-                    </tr>
-                    {% else %}
-                    <tr>
-                        <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 20px;">
-                            কোনো ভাউচার পিন তৈরি করা হয়নি।
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
+# ─── Site Settings ───
+SITE_SETTINGS_CONTENT = """
+<div class="card" style="max-width:620px;margin:0 auto">
+  <h3>🎨 সাইট কাস্টমাইজেশন</h3>
+  <p style="color:var(--muted);font-size:.85rem;margin-bottom:18px">
+    ক্যাপটিভ পোর্টালের নাম, রঙ ও টেক্সট পরিবর্তন করুন।
+  </p>
+  <form method="POST">
+    <div class="form-group">
+      <label>হটস্পট নাম (Navbar-এ দেখাবে)</label>
+      <input name="hotspot_name" class="form-control" value="{{ s.hotspot_name }}" required>
     </div>
-
-    <!-- Active Vouchers Print Preview Card -->
-    {% if active_pins_list %}
-    <div class="card">
-        <h3>🖨️ প্রিন্ট ও কাস্টমারদের জন্য রেডি ভাউচার (Active Vouchers)</h3>
-        <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 4px;">নিচের ভাউচারগুলো ইউজারদের হটস্পট ব্যবহারের জন্য দিতে পারেন:</p>
-        <div class="voucher-grid">
-            {% for v in active_pins_list %}
-            <div class="voucher-card">
-                <small style="font-weight: 600; color: #007bff;">WIFI ACCESS VOUCHER</small>
-                <div class="pin">{{ v.pin }}</div>
-                <small style="color: #64748b;">4-Digit Login PIN</small>
-            </div>
-            {% endfor %}
-        </div>
+    <div class="form-group">
+      <label>পোর্টাল টাইটেল (বড় শিরোনাম)</label>
+      <input name="site_name" class="form-control" value="{{ s.site_name }}" required>
     </div>
-    {% endif %}
-{% endblock %}
-"""
+    <div class="form-group">
+      <label>সাবটাইটেল</label>
+      <input name="site_subtitle" class="form-control" value="{{ s.site_subtitle }}">
+    </div>
+    <div class="form-group">
+      <label>পিন বক্সের উপরের নির্দেশনা</label>
+      <input name="welcome_text" class="form-control" value="{{ s.welcome_text }}" required>
+    </div>
+    <div class="form-group">
+      <label>ফুটার নোট</label>
+      <input name="footer_text" class="form-control" value="{{ s.footer_text }}">
+    </div>
+    <div class="form-group">
+      <label>
+        প্রাইমারি রঙ (Header ও বাটনের রঙ)
+        <span class="color-preview" id="clrPreview" style="background:{{ s.primary_color }}"></span>
+      </label>
+      <input type="color" name="primary_color" id="clrPicker"
+             class="form-control" value="{{ s.primary_color }}"
+             style="height:46px;padding:4px 8px;cursor:pointer"
+             oninput="document.getElementById('clrPreview').style.background=this.value">
+    </div>
+    <div class="form-group">
+      <label>গেটওয়ে IP (আপনার হটস্পটের IP)</label>
+      <input name="gateway_ip" class="form-control" value="{{ s.gateway_ip }}"
+             placeholder="192.168.43.1">
+      <small style="color:var(--muted)">Termux-এ <code>ip addr show wlan0</code> দিয়ে বের করুন।</small>
+    </div>
+    <button type="submit" class="btn btn-primary btn-block" style="padding:12px">
+      💾 সেটিংস সেভ করুন
+    </button>
+  </form>
+</div>
 
+<div class="card" style="max-width:620px;margin:22px auto 0">
+  <h3>👁️ পোর্টালের প্রিভিউ লিংক</h3>
+  <p style="color:var(--muted);font-size:.85rem;margin-bottom:10px">
+    সেটিংস সেভ করার পর পোর্টাল এভাবে দেখাবে:
+  </p>
+  <a href="{{ url_for('portal_index') }}" target="_blank"
+     class="btn btn-secondary btn-sm">↗️ পোর্টাল দেখুন (নতুন ট্যাবে)</a>
+</div>"""
+
+# ─── Admin Settings ───
 ADMIN_SETTINGS_CONTENT = """
-{% extends base_template %}
-{% block content %}
-    <div class="card" style="max-width: 550px; margin: 0 auto;">
-        <h3 style="margin-bottom: 20px;">🔐 অ্যাডমিন পাসওয়ার্ড পরিবর্তন</h3>
-        <form action="{{ url_for('admin_settings') }}" method="POST">
-            <div class="form-group">
-                <label for="current_password">বর্তমান পাসওয়ার্ড (Current Password)</label>
-                <input type="password" name="current_password" id="current_password" class="form-control" required>
-            </div>
-            <div class="form-group">
-                <label for="new_username">নতুন ইউজারনেম (New Username)</label>
-                <input type="text" name="new_username" id="new_username" class="form-control" value="{{ admin_user.username }}" required>
-            </div>
-            <div class="form-group">
-                <label for="new_password">নতুন পাসওয়ার্ড (New Password)</label>
-                <input type="password" name="new_password" id="new_password" class="form-control" placeholder="কমপক্ষে ৪ অক্ষরের পাসওয়ার্ড" required>
-            </div>
-            <div class="form-group">
-                <label for="confirm_password">নতুন পাসওয়ার্ড নিশ্চিত করুন (Confirm)</label>
-                <input type="password" name="confirm_password" id="confirm_password" class="form-control" required>
-            </div>
-            <button type="submit" class="btn btn-primary btn-block" style="padding: 12px;">পাসওয়ার্ড আপডেট করুন</button>
-        </form>
+<div class="card" style="max-width:520px;margin:0 auto">
+  <h3>🔐 অ্যাডমিন পাসওয়ার্ড পরিবর্তন</h3>
+  <form method="POST">
+    <div class="form-group">
+      <label>বর্তমান পাসওয়ার্ড</label>
+      <input type="password" name="current_password" class="form-control" required>
     </div>
-{% endblock %}
-"""
-
-ADMIN_GUIDE_CONTENT = """
-{% extends base_template %}
-{% block content %}
-    <div class="card">
-        <h3>📱 টার্মাক্স (Termux) ওয়াইফাই হটস্পট ও ক্যাপটিভ পোর্টাল সেটআপ গাইড</h3>
-        <p style="color: var(--text-muted); margin-top: 6px; font-size: 0.9rem;">
-            অ্যান্ড্রয়েড ফোনে ওয়াইফাই হটস্পট অন করে টার্মাক্সকে MikroTik-এর মতো ক্যাপটিভ পোর্টাল রাউটার বানানোর জন্য নিচের ধাপগুলো অনুসরণ করুন।
-        </p>
-        
-        <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--border);">
-
-        <h4 style="margin-bottom: 8px; color: var(--dark);">১. প্রয়োজনীয় প্যাকেজ ইনস্টল করুন:</h4>
-        <pre class="terminal">pkg update && pkg install -y python iptables dnsmasq tsu root-repo
-pip install flask</pre>
-
-        <h4 style="margin: 20px 0 8px; color: var(--dark);">২. রুট শেল ও আইপি ফরওয়ার্ডিং এনাবল করুন:</h4>
-        <pre class="terminal"># রুট এক্সেস নিন
-tsu
-
-# কার্নেলে প্যাকেট ফরওয়ার্ডিং অন করুন
-echo 1 > /proc/sys/net/ipv4/ip_forward</pre>
-
-        <h4 style="margin: 20px 0 8px; color: var(--dark);">৩. ওয়াইফাই হটস্পট ইন্টারফেস শনাক্ত করুন:</h4>
-        <pre class="terminal"># ইন্টারফেস দেখতে
-ip addr show
-# সচরাচর অ্যান্ড্রয়েডে হটস্পট ইন্টারফেস wlan0, wlan1 বা ap0 হয়।
-# আপনার মোবাইলের হটস্পটের গেটওয়ে IP সাধারণত 192.168.43.1 হয়।</pre>
-
-        <h4 style="margin: 20px 0 8px; color: var(--dark);">৪. iptables দিয়ে সমস্ত HTTP ট্রাফিক ফ্লাস্কে (Port 8080) রিডাইরেক্ট করুন:</h4>
-        <pre class="terminal"># ক্যাপটিভ পোর্টাল রিডাইরেকশন রুল (Port 80 to 8080)
-iptables -t nat -F
-iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport 80 -j REDIRECT --to-port 8080
-
-# ডিএনএস রিডাইরেকশন (Port 53)
-iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 53 -j REDIRECT --to-port 5353</pre>
-
-        <h4 style="margin: 20px 0 8px; color: var(--dark);">৫. dnsmasq দিয়ে সব ডোমেইনকে আপনার আইপিতে পয়েন্ট করুন (DNS Spoofing):</h4>
-        <pre class="terminal"># সমস্ত DNS কুয়েরিকে আপনার টার্মাক্স সার্ভারে (192.168.43.1) পাঠাতে:
-dnsmasq -k -a 192.168.43.1 --address=/#/192.168.43.1 -p 5353 &</pre>
-
-        <h4 style="margin: 20px 0 8px; color: var(--dark);">৬. ফ্লাস্ক অ্যাপটি ব্যাকগ্রাউন্ডে বা স্ক্রিনে চালু রাখুন:</h4>
-        <pre class="terminal">python app.py</pre>
-
-        <div class="alert alert-info" style="margin-top: 20px;">
-            💡 <strong>টিপস:</strong> যখনই কোনো ক্লায়েন্ট মোবাইল আপনার হটস্পটে কানেক্ট করবে, অ্যান্ড্রয়েড বা আইফোনের নিজস্ব অপারেটিং সিস্টেম স্বয়ংক্রিয়ভাবে Captive Portal Detection রিকোয়েস্ট পাঠাবে এবং সাথে সাথে ভাউচার লগইন পেজ স্ক্রিনে পপআপ হয়ে উঠবে!
-        </div>
+    <div class="form-group">
+      <label>নতুন ইউজারনেম</label>
+      <input name="new_username" class="form-control" value="{{ admin.username }}" required>
     </div>
-{% endblock %}
-"""
+    <div class="form-group">
+      <label>নতুন পাসওয়ার্ড</label>
+      <input type="password" name="new_password" class="form-control"
+             placeholder="কমপক্ষে ৪ অক্ষর" required>
+    </div>
+    <div class="form-group">
+      <label>নতুন পাসওয়ার্ড নিশ্চিত করুন</label>
+      <input type="password" name="confirm_password" class="form-control" required>
+    </div>
+    <button type="submit" class="btn btn-primary btn-block" style="padding:12px">
+      আপডেট করুন
+    </button>
+  </form>
+</div>"""
 
-# ---------------------------------------------------------------------------
-# Captive Portal Detection Routes (Android, Apple, Windows, Chrome)
-# ---------------------------------------------------------------------------
-@app.route("/generate_204")          # Android OS captive portal check
-@app.route("/gen_204")               # Android alternative
-@app.route("/hotspot-detect.html")   # Apple iOS & macOS captive portal check
-@app.route("/ncsi.txt")              # Windows NCSI check
-@app.route("/canonical.html")        # Firefox / Chrome captive check
-@app.route("/connecttest.txt")       # Windows 10/11
+# ─── Termux Guide ───
+GUIDE_CONTENT = """
+<div class="card">
+  <h3>📱 Termux ক্যাপটিভ পোর্টাল সেটআপ গাইড</h3>
+  <p style="color:var(--muted);font-size:.88rem;margin-top:5px">
+    Android হটস্পটে কানেক্ট হওয়া মাত্র পোর্টাল পপআপ করার জন্য <strong>Root + iptables</strong> প্রয়োজন।
+  </p>
+
+  <hr style="border:none;border-top:1px solid var(--border);margin:18px 0">
+
+  <h4 style="margin-bottom:8px">১. ইনস্টল করুন (একবারই)</h4>
+  <pre class="terminal">pkg update -y && pkg upgrade -y
+pkg install -y python git root-repo
+pkg install -y iptables dnsmasq tsu
+pip install -r requirements.txt</pre>
+
+  <h4 style="margin:18px 0 8px">২. হটস্পট ইন্টারফেস বের করুন</h4>
+  <pre class="terminal">ip addr show
+# সচরাচর: wlan0, ap0, wlan1</pre>
+
+  <h4 style="margin:18px 0 8px">৩. Root শেল নিন</h4>
+  <pre class="terminal">tsu</pre>
+
+  <h4 style="margin:18px 0 8px">৪. IP Forwarding চালু করুন</h4>
+  <pre class="terminal">echo 1 > /proc/sys/net/ipv4/ip_forward</pre>
+
+  <h4 style="margin:18px 0 8px">৫. iptables — Port 80/443 → Flask (8080)</h4>
+  <pre class="terminal">iptables -t nat -F
+iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport 80  -j REDIRECT --to-port 8080
+iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport 443 -j REDIRECT --to-port 8080
+iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 53  -j REDIRECT --to-port 5353</pre>
+
+  <h4 style="margin:18px 0 8px">৬. DNS Spoofing — সব ডোমেইন নিজের IP-এ</h4>
+  <pre class="terminal">dnsmasq -k -a {{ s.gateway_ip }} --address=/#/{{ s.gateway_ip }} -p 5353 --no-resolv --no-poll &</pre>
+
+  <h4 style="margin:18px 0 8px">৭. Flask সার্ভার চালু করুন (নতুন Termux সেশনে)</h4>
+  <pre class="terminal">python app.py</pre>
+
+  <div class="alert alert-info" style="margin-top:18px">
+    💡 <strong>কিভাবে কাজ করে:</strong> কানেক্টেড ডিভাইস Google/Apple-এর captive portal check URL-এ request করে →
+    dnsmasq সেই domain-কে আপনার IP-এ পয়েন্ট করে → Flask 302 redirect করে → 
+    OS স্বয়ংক্রিয়ভাবে <strong>"Sign in to Network"</strong> পপআপ দেখায়।
+  </div>
+  <div class="alert alert-warning" style="margin-top:10px">
+    ⚠️ iptables ছাড়া কাজ করবে না। ম্যানুয়ালি <strong>http://{{ s.gateway_ip }}:8080</strong> দিয়ে এক্সেস করতে হবে।
+  </div>
+</div>"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ══  CAPTIVE PORTAL DETECTION ROUTES  ══
+# ─────────────────────────────────────────────────────────────────────────────
+DETECT_PATHS = [
+    "/generate_204", "/gen_204",
+    "/hotspot-detect.html",
+    "/ncsi.txt", "/connecttest.txt",
+    "/canonical.html",
+]
+
+@app.route("/generate_204")
+@app.route("/gen_204")
+@app.route("/hotspot-detect.html")
+@app.route("/ncsi.txt")
+@app.route("/connecttest.txt")
+@app.route("/canonical.html")
 def captive_detect():
-    """
-    Standard captive portal detection endpoints.
-    If authenticated, returns expected success signals.
-    If unauthenticated, redirects to captive login portal.
-    """
-    client_ip = get_client_ip()
-    if is_ip_authenticated(client_ip):
-        # Respond as authorized based on endpoint
-        if request.path.endswith("204"):
-            return ("", 204)
-        elif request.path.endswith("ncsi.txt"):
-            return ("Microsoft NCSI", 200, {"Content-Type": "text/plain"})
-        elif request.path.endswith("hotspot-detect.html"):
-            return ("<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>", 200)
-        return ("Success", 200)
-    
-    # Not authenticated: Redirect immediately to login page to trigger OS portal popup
-    return redirect(url_for("portal_index"))
+    ip = client_ip()
+    if is_authenticated(ip):
+        # Return the "success" signal each OS expects
+        p = request.path
+        if "204" in p:
+            return Response(status=204)
+        if "ncsi" in p or "connecttest" in p:
+            return Response("Microsoft NCSI", 200, content_type="text/plain")
+        if "hotspot" in p:
+            return Response("<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>", 200)
+        return Response("Success", 200)
+    # Not authenticated → redirect to portal (triggers OS popup)
+    return redirect(url_for("portal_index"), 302)
 
-# ---------------------------------------------------------------------------
-# User Captive Portal Routes
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# ══  USER ROUTES  ══
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/")
 def portal_index():
-    client_ip = get_client_ip()
-    if is_ip_authenticated(client_ip):
+    ip = client_ip()
+    if is_authenticated(ip):
         return redirect(url_for("portal_status"))
-    return render_template_string(LOGIN_HTML, css=BASE_CSS, client_ip=client_ip)
+    s   = get_settings()
+    css = base_css(s.get("primary_color", "#007bff"))
+    return render_template_string(PORTAL_LOGIN_TMPL, s=s, css=css, ip=ip)
 
-@app.route("/login", methods=["GET", "POST"])
+@app.route("/login", methods=["GET","POST"])
 def login():
-    client_ip = get_client_ip()
-    
+    ip = client_ip()
     if request.method == "GET":
-        if is_ip_authenticated(client_ip):
-            return redirect(url_for("portal_status"))
-        return render_template_string(LOGIN_HTML, css=BASE_CSS, client_ip=client_ip)
+        return redirect(url_for("portal_index"))
 
-    pin = request.form.get("pin", "").strip()
-    
+    pin = request.form.get("pin","").strip()
     if not pin or len(pin) != 4 or not pin.isdigit():
-        flash("❌ অনুগ্রহ করে সঠিক ৪-ডিজিটের সংখ্যা পিন দিন!", "danger")
+        flash("❌ সঠিক ৪-ডিজিট পিন দিন!", "danger")
         return redirect(url_for("portal_index"))
 
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM vouchers WHERE pin = ?", (pin,))
-    voucher = cursor.fetchone()
+    voucher = conn.execute("SELECT * FROM vouchers WHERE pin=?", (pin,)).fetchone()
 
     if not voucher:
         conn.close()
-        flash("❌ অবৈধ ভাউচার পিন! পুনরায় চেষ্টা করুন।", "danger")
+        flash("❌ পিনটি বৈধ নয়!", "danger")
         return redirect(url_for("portal_index"))
 
     if voucher["status"] != "active":
         conn.close()
-        flash("⚠️ এই পিনটি ইতোমধ্যে ব্যবহার করা হয়েছে!", "warning")
+        flash("⚠️ এই পিনটি আগেই ব্যবহৃত হয়েছে!", "warning")
         return redirect(url_for("portal_index"))
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Mark voucher as used
-    cursor.execute(
-        "UPDATE vouchers SET status = 'used', used_at = ?, used_by_ip = ? WHERE id = ?",
-        (now_str, client_ip, voucher["id"])
-    )
-    # Register active session
-    cursor.execute(
-        "INSERT OR REPLACE INTO active_sessions (client_ip, pin, login_time, user_agent) VALUES (?, ?, ?, ?)",
-        (client_ip, pin, now_str, request.headers.get("User-Agent", ""))
-    )
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("UPDATE vouchers SET status='used', used_at=?, used_by_ip=? WHERE id=?",
+                 (now, ip, voucher["id"]))
+    conn.execute("INSERT OR REPLACE INTO active_sessions (client_ip,pin,login_time,user_agent) VALUES (?,?,?,?)",
+                 (ip, pin, now, request.headers.get("User-Agent","")))
     conn.commit()
     conn.close()
 
-    # Trigger iptables internet allow in Termux root
-    allow_client_internet(client_ip)
-
-    flash("✅ সফলভাবে অথেনটিকেটেড! ইন্টারনেট সংযোগ চালু হয়েছে।", "success")
+    allow_ip(ip)
+    flash("✅ সফলভাবে কানেক্টেড! ইন্টারনেট চালু হয়েছে।", "success")
     return redirect(url_for("portal_status"))
 
 @app.route("/status")
 def portal_status():
-    client_ip = get_client_ip()
+    ip   = client_ip()
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM active_sessions WHERE client_ip = ?", (client_ip,))
-    session_data = cursor.fetchone()
+    sess = conn.execute("SELECT * FROM active_sessions WHERE client_ip=?", (ip,)).fetchone()
     conn.close()
-
-    if not session_data:
+    if not sess:
         return redirect(url_for("portal_index"))
-
-    return render_template_string(STATUS_HTML, css=BASE_CSS, session_data=session_data)
+    s   = get_settings()
+    css = base_css(s.get("primary_color","#007bff"))
+    return render_template_string(STATUS_TMPL, s=s, css=css, sess=sess)
 
 @app.route("/user-logout", methods=["POST"])
 def user_logout():
-    client_ip = get_client_ip()
+    ip = client_ip()
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM active_sessions WHERE client_ip = ?", (client_ip,))
+    conn.execute("DELETE FROM active_sessions WHERE client_ip=?", (ip,))
     conn.commit()
     conn.close()
-
-    # Revoke iptables rule
-    revoke_client_internet(client_ip)
-
-    flash("ℹ️ আপনি সফলভাবে ডিসকানেক্ট হয়েছেন।", "info")
+    revoke_ip(ip)
+    flash("ডিসকানেক্ট হয়েছেন।", "info")
     return redirect(url_for("portal_index"))
 
-# ---------------------------------------------------------------------------
-# Admin Routes
-# ---------------------------------------------------------------------------
-@app.route("/admin/login", methods=["GET", "POST"])
+# ─────────────────────────────────────────────────────────────────────────────
+# ══  ADMIN ROUTES  ══
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/admin/login", methods=["GET","POST"])
 def admin_login():
     if session.get("admin_logged_in"):
         return redirect(url_for("admin_dashboard"))
+    s   = get_settings()
+    css = base_css(s.get("primary_color","#007bff"))
 
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "").strip()
-
+        username = request.form.get("username","").strip()
+        password = request.form.get("password","").strip()
         conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM admin_users WHERE username = ?", (username,))
-        user = cursor.fetchone()
+        user = conn.execute("SELECT * FROM admin_users WHERE username=?", (username,)).fetchone()
         conn.close()
-
         if user and check_password_hash(user["password_hash"], password):
             session["admin_logged_in"] = True
-            session["admin_username"] = user["username"]
-            flash(f"স্বাগতম {user['username']}! অ্যাডমিন প্যানেলে সফলভাবে লগইন করেছেন।", "success")
+            session["admin_username"]  = user["username"]
+            session.permanent = True
+            flash(f"স্বাগতম {user['username']}!", "success")
             return redirect(url_for("admin_dashboard"))
-        else:
-            flash("❌ ভুল ইউজারনেম বা পাসওয়ার্ড!", "danger")
+        flash("❌ ভুল ইউজারনেম বা পাসওয়ার্ড!", "danger")
 
-    return render_template_string(ADMIN_LOGIN_HTML, css=BASE_CSS)
+    return render_template_string(ADMIN_LOGIN_TMPL, css=css)
 
 @app.route("/admin/logout")
 def admin_logout():
-    session.pop("admin_logged_in", None)
-    session.pop("admin_username", None)
-    flash("সফলভাবে লগআউট হয়েছেন।", "info")
+    session.clear()
+    flash("লগআউট হয়েছেন।", "info")
     return redirect(url_for("admin_login"))
 
 @app.route("/admin")
 @admin_required
 def admin_dashboard():
     conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) AS total FROM vouchers")
-    total_pins = cursor.fetchone()["total"]
-
-    cursor.execute("SELECT COUNT(*) AS active FROM vouchers WHERE status = 'active'")
-    active_pins = cursor.fetchone()["active"]
-
-    cursor.execute("SELECT COUNT(*) AS used FROM vouchers WHERE status = 'used'")
-    used_pins = cursor.fetchone()["used"]
-
-    cursor.execute("SELECT * FROM active_sessions ORDER BY login_time DESC")
-    active_sessions = cursor.fetchall()
-    active_users = len(active_sessions)
-
-    stats = {
-        "total_pins": total_pins,
-        "active_pins": active_pins,
-        "used_pins": used_pins,
-        "active_users": active_users
-    }
-
+    total  = conn.execute("SELECT COUNT(*) FROM vouchers").fetchone()[0]
+    active = conn.execute("SELECT COUNT(*) FROM vouchers WHERE status='active'").fetchone()[0]
+    used   = conn.execute("SELECT COUNT(*) FROM vouchers WHERE status='used'").fetchone()[0]
+    sessions = conn.execute("SELECT * FROM active_sessions ORDER BY login_time DESC").fetchall()
     conn.close()
-    return render_template_string(
-        ADMIN_DASHBOARD_CONTENT,
-        base_template=ADMIN_BASE,
-        css=BASE_CSS,
-        title="ড্যাশবোর্ড",
-        active_page="dashboard",
-        stats=stats,
-        active_sessions=active_sessions
-    )
+    st = dict(total=total, active=active, used=used, online=len(sessions))
+    html = render_template_string(DASH_CONTENT, st=st, sessions=sessions,
+                                  url_for=url_for)
+    return render_admin("ড্যাশবোর্ড", "dashboard", html)
 
 @app.route("/admin/vouchers")
 @admin_required
 def admin_vouchers():
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM vouchers ORDER BY id DESC")
-    pins = cursor.fetchall()
-
-    cursor.execute("SELECT * FROM vouchers WHERE status = 'active' ORDER BY id DESC")
-    active_pins_list = cursor.fetchall()
+    pins       = conn.execute("SELECT * FROM vouchers ORDER BY id DESC").fetchall()
+    active_pins = conn.execute("SELECT * FROM vouchers WHERE status='active' ORDER BY id DESC").fetchall()
     conn.close()
-
-    return render_template_string(
-        ADMIN_VOUCHERS_CONTENT,
-        base_template=ADMIN_BASE,
-        css=BASE_CSS,
-        title="ভাউচার ম্যানেজমেন্ট",
-        active_page="vouchers",
-        pins=pins,
-        active_pins_list=active_pins_list
-    )
+    html = render_template_string(VOUCHER_CONTENT, pins=pins, active_pins=active_pins,
+                                  url_for=url_for)
+    return render_admin("ভাউচার ম্যানেজমেন্ট", "vouchers", html)
 
 @app.route("/admin/generate-pin", methods=["POST"])
 @admin_required
 def admin_generate_pin():
-    custom_pin = request.form.get("custom_pin", "").strip()
-    count = int(request.form.get("count", 1))
-
-    conn = get_db()
-    cursor = conn.cursor()
-
-    generated_count = 0
-    if custom_pin:
-        if len(custom_pin) != 4 or not custom_pin.isdigit():
-            flash("❌ কাস্টম পিন অবশ্যই ঠিক ৪ ডিজিটের সংখ্যা হতে হবে!", "danger")
-            conn.close()
-            return redirect(url_for("admin_dashboard"))
-        
-        try:
-            cursor.execute("INSERT INTO vouchers (pin, status) VALUES (?, 'active')", (custom_pin,))
-            conn.commit()
-            flash(f"✅ কাস্টম পিন {custom_pin} সফলভাবে তৈরি হয়েছে!", "success")
-        except sqlite3.IntegrityError:
-            flash(f"⚠️ পিন {custom_pin} ইতোমধ্যে ডাটাবেসে বিদ্যমান!", "warning")
+    custom = request.form.get("custom_pin","").strip()
+    count  = int(request.form.get("count", 1))
+    conn   = get_db()
+    ok = 0
+    if custom:
+        if len(custom) != 4 or not custom.isdigit():
+            flash("❌ কাস্টম পিন অবশ্যই ৪ সংখ্যার হতে হবে!", "danger")
+        else:
+            try:
+                conn.execute("INSERT INTO vouchers (pin) VALUES (?)", (custom,))
+                conn.commit()
+                flash(f"✅ পিন {custom} তৈরি হয়েছে!", "success")
+            except sqlite3.IntegrityError:
+                flash(f"⚠️ পিন {custom} ইতোমধ্যে আছে!", "warning")
     else:
-        # Generate random 4-digit PINs
         for _ in range(count):
-            attempts = 0
-            while attempts < 50:
-                rand_pin = f"{random.randint(1000, 9999)}"
+            for __ in range(100):
+                p = str(random.randint(1000,9999))
                 try:
-                    cursor.execute("INSERT INTO vouchers (pin, status) VALUES (?, 'active')", (rand_pin,))
-                    conn.commit()
-                    generated_count += 1
-                    break
+                    conn.execute("INSERT INTO vouchers (pin) VALUES (?)", (p,))
+                    conn.commit(); ok += 1; break
                 except sqlite3.IntegrityError:
-                    attempts += 1
                     continue
-        flash(f"✅ মোট {generated_count}টি নতুন ৪-ডিজিটের ভাউচার পিন তৈরি হয়েছে!", "success")
-
+        flash(f"✅ {ok}টি নতুন পিন তৈরি হয়েছে!", "success")
     conn.close()
     return redirect(url_for("admin_dashboard"))
 
@@ -1233,136 +926,116 @@ def admin_generate_pin():
 @admin_required
 def admin_delete_pin(pin_id):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM vouchers WHERE id = ?", (pin_id,))
-    conn.commit()
-    conn.close()
-    flash("🗑️ ভাউচার পিন ডিলিট করা হয়েছে।", "info")
+    conn.execute("DELETE FROM vouchers WHERE id=?", (pin_id,))
+    conn.commit(); conn.close()
+    flash("🗑️ পিন ডিলিট হয়েছে।", "info")
     return redirect(url_for("admin_vouchers"))
 
 @app.route("/admin/clear-used", methods=["POST"])
 @admin_required
 def admin_clear_used_pins():
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM vouchers WHERE status = 'used'")
-    count = cursor.rowcount
-    conn.commit()
-    conn.close()
-    flash(f"🗑️ মোট {count}টি ব্যবহৃত পিন মুছে ফেলা হয়েছে।", "info")
+    n = conn.execute("DELETE FROM vouchers WHERE status='used'").rowcount
+    conn.commit(); conn.close()
+    flash(f"🗑️ {n}টি ব্যবহৃত পিন মুছে ফেলা হয়েছে।", "info")
     return redirect(url_for("admin_vouchers"))
 
 @app.route("/admin/kick-user", methods=["POST"])
 @admin_required
 def admin_kick_user():
-    client_ip = request.form.get("client_ip")
-    if client_ip:
+    ip = request.form.get("client_ip","")
+    if ip:
         conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM active_sessions WHERE client_ip = ?", (client_ip,))
-        conn.commit()
-        conn.close()
-        revoke_client_internet(client_ip)
-        flash(f"🚫 ডিভাইস ({client_ip}) সফলভাবে নেটওয়ার্ক থেকে ডিসকানেক্ট করা হয়েছে।", "warning")
+        conn.execute("DELETE FROM active_sessions WHERE client_ip=?", (ip,))
+        conn.commit(); conn.close()
+        revoke_ip(ip)
+        flash(f"🚫 {ip} ডিসকানেক্ট করা হয়েছে।", "warning")
     return redirect(url_for("admin_dashboard"))
 
-@app.route("/admin/settings", methods=["GET", "POST"])
+@app.route("/admin/site-settings", methods=["GET","POST"])
+@admin_required
+def admin_site_settings():
+    if request.method == "POST":
+        fields = ["site_name","site_subtitle","welcome_text",
+                  "footer_text","hotspot_name","primary_color","gateway_ip"]
+        conn = get_db()
+        for f in fields:
+            v = request.form.get(f,"").strip()
+            if v:
+                conn.execute("INSERT OR REPLACE INTO site_settings (key,value) VALUES (?,?)", (f,v))
+        conn.commit(); conn.close()
+        flash("✅ সাইট সেটিংস সেভ হয়েছে!", "success")
+        return redirect(url_for("admin_site_settings"))
+
+    s    = get_settings()
+    html = render_template_string(SITE_SETTINGS_CONTENT, s=s, url_for=url_for)
+    return render_admin("সাইট সেটিংস", "site", html)
+
+@app.route("/admin/settings", methods=["GET","POST"])
 @admin_required
 def admin_settings():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM admin_users WHERE username = ?", (session.get("admin_username"),))
-    admin_user = cursor.fetchone()
+    conn  = get_db()
+    admin = conn.execute("SELECT * FROM admin_users WHERE username=?",
+                         (session["admin_username"],)).fetchone()
 
     if request.method == "POST":
-        current_password = request.form.get("current_password", "").strip()
-        new_username = request.form.get("new_username", "").strip()
-        new_password = request.form.get("new_password", "").strip()
-        confirm_password = request.form.get("confirm_password", "").strip()
+        cur  = request.form.get("current_password","")
+        nu   = request.form.get("new_username","").strip()
+        np_  = request.form.get("new_password","")
+        cnf  = request.form.get("confirm_password","")
 
-        if not check_password_hash(admin_user["password_hash"], current_password):
+        if not check_password_hash(admin["password_hash"], cur):
             flash("❌ বর্তমান পাসওয়ার্ড ভুল!", "danger")
-        elif len(new_password) < 4:
-            flash("❌ নতুন পাসওয়ার্ড কমপক্ষে ৪ অক্ষরের হতে হবে!", "danger")
-        elif new_password != confirm_password:
-            flash("❌ নতুন পাসওয়ার্ড এবং কনফার্মেশন মিলছে না!", "danger")
-        elif not new_username:
+        elif len(np_) < 4:
+            flash("❌ পাসওয়ার্ড কমপক্ষে ৪ অক্ষরের হতে হবে!", "danger")
+        elif np_ != cnf:
+            flash("❌ নতুন পাসওয়ার্ড মিলছে না!", "danger")
+        elif not nu:
             flash("❌ ইউজারনেম খালি রাখা যাবে না!", "danger")
         else:
-            new_hash = generate_password_hash(new_password)
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute(
-                "UPDATE admin_users SET username = ?, password_hash = ?, updated_at = ? WHERE id = ?",
-                (new_username, new_hash, now_str, admin_user["id"])
-            )
+            conn.execute("UPDATE admin_users SET username=?, password_hash=? WHERE id=?",
+                         (nu, generate_password_hash(np_), admin["id"]))
             conn.commit()
-            session["admin_username"] = new_username
-            flash("✅ ইউজারনেম ও পাসওয়ার্ড সফলভাবে আপডেট করা হয়েছে!", "success")
+            session["admin_username"] = nu
+            flash("✅ ক্রেডেনশিয়াল আপডেট হয়েছে!", "success")
             conn.close()
             return redirect(url_for("admin_dashboard"))
 
     conn.close()
-    return render_template_string(
-        ADMIN_SETTINGS_CONTENT,
-        base_template=ADMIN_BASE,
-        css=BASE_CSS,
-        title="অ্যাডমিন সেটিংস",
-        active_page="settings",
-        admin_user=admin_user
-    )
+    html = render_template_string(ADMIN_SETTINGS_CONTENT, admin=admin, url_for=url_for)
+    return render_admin("অ্যাডমিন সেটিংস", "settings", html)
 
 @app.route("/admin/guide")
 @admin_required
 def admin_termux_guide():
-    return render_template_string(
-        ADMIN_GUIDE_CONTENT,
-        base_template=ADMIN_BASE,
-        css=BASE_CSS,
-        title="টার্মাক্স গাইড",
-        active_page="guide"
-    )
+    s    = get_settings()
+    html = render_template_string(GUIDE_CONTENT, s=s, url_for=url_for)
+    return render_admin("Termux গাইড", "guide", html)
 
-# ---------------------------------------------------------------------------
-# CLI Guide & Banner
-# ---------------------------------------------------------------------------
-def print_startup_banner():
-    banner = f"""
-=============================================================================
-  __  __ _ _           _____ _ _      _    _       _                  _   
- |  \/  (_) |         |_   _(_) |    | |  | |     | |                | |  
- | \  / |_| | ___ __ ___| |  _| | __ | |__| | ___ | |_ ___ _ __   ___| |_ 
- | |\/| | | |/ / '__/ _ \ | | | |/ / |  __  |/ _ \| __/ __| '_ \ / _ \ __|
- | |  | | |   <| | | (_) || | | |   <  | |  | | (_) | |_\__ \ |_) | (_) | |_ 
- |_|  |_|_|_|\_\_|  \___/ |_| |_|_|\_\ |_|  |_|\___/ \__|___/ .__/ \___/\__|
-                                                            | |              
-                                                            |_|              
-           MIKROTIK-STYLE CAPTIVE PORTAL & HOTSPOT SYSTEM
-=============================================================================
-[+] Server running at: http://{HOST}:{PORT}
-[+] Captive Portal:   http://{HOST}:{PORT}/
-[+] Admin Dashboard:  http://{HOST}:{PORT}/admin
-[+] Default Admin:    Username: admin | Password: admin
-[+] Database:         {DB_PATH}
-=============================================================================
->>> TERMUX HOTSPOT REDIRECTION COMMANDS (Run as root using 'tsu'):
------------------------------------------------------------------------------
-1. Enable IP Forwarding:
-   echo 1 > /proc/sys/net/ipv4/ip_forward
+# ─────────────────────────────────────────────────────────────────────────────
+# Startup
+# ─────────────────────────────────────────────────────────────────────────────
+def banner():
+    print("""
+╔══════════════════════════════════════════════════════════╗
+║     MikroTik-Style Captive Portal — Hotspot System      ║
+╠══════════════════════════════════════════════════════════╣
+║  Portal  →  http://0.0.0.0:8080/                        ║
+║  Admin   →  http://0.0.0.0:8080/admin                   ║
+║  Login   →  admin / admin                               ║
+╠══════════════════════════════════════════════════════════╣
+║  TERMUX iptables redirect (run as root with tsu):       ║
+║  echo 1 > /proc/sys/net/ipv4/ip_forward                 ║
+║  iptables -t nat -A PREROUTING -i wlan0 -p tcp          ║
+║           --dport 80 -j REDIRECT --to-port 8080         ║
+║  iptables -t nat -A PREROUTING -i wlan0 -p udp          ║
+║           --dport 53 -j REDIRECT --to-port 5353         ║
+║  dnsmasq -k -a 192.168.43.1 --address=/#/192.168.43.1  ║
+║          -p 5353 --no-resolv --no-poll &                ║
+╚══════════════════════════════════════════════════════════╝
+""")
 
-2. Redirect Port 80 HTTP traffic to Flask:
-   iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port {PORT}
-
-3. DNS Redirection (to catch captive portal checks):
-   iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-port 5353
-   dnsmasq -k -a 192.168.43.1 --address=/#/192.168.43.1 -p 5353 &
-=============================================================================
-"""
-    print(banner)
-
-# ---------------------------------------------------------------------------
-# Application Entry Point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     init_db()
-    print_startup_banner()
-    app.run(host=HOST, port=PORT, debug=False)
+    banner()
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
